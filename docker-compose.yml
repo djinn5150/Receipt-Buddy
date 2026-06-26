@@ -1,0 +1,14 @@
+version: '3.8'
+
+services:
+  receipt-manager:
+    build: .
+    container_name: receipt-manager
+    ports:
+      - "3000:3000"
+    environment:
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+    volumes:
+      - ./data:/app/data
+      - ./uploads:/app/uploads
+    restart: unless-stopped
