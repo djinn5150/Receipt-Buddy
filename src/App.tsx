@@ -1,12 +1,12 @@
-import React, { useState, useEffect } from 'react';
-import { Upload, Settings, List, PieChart as PieChartIcon, Check, Loader2 } from 'lucide-react';
+import React, { useState, useEffect, useMemo } from 'react';
+import { Upload, Settings, List, PieChart as PieChartIcon, Check, Loader2, ChevronLeft, ChevronRight } from 'lucide-react';
 import { PieChart, Pie, Cell, ResponsiveContainer, Tooltip, Legend } from 'recharts';
-import { format, parseISO } from 'date-fns';
+import { format, parseISO, addDays, isWithinInterval, startOfDay, endOfDay } from 'date-fns';
 
 const COLORS = ['#0088FE', '#00C49F', '#FFBB28', '#FF8042', '#8884d8', '#ffc658'];
 
 export default function App() {
-  const [activeTab, setActiveTab] = useState<'dashboard' | 'receipts'>('dashboard');
+  const [activeTab, setActiveTab] = useState<'dashboard' | 'receipts' | 'items' | 'recipes'>('dashboard');
   const [settingsOpen, setSettingsOpen] = useState(false);
   
   // Data
@@ -37,6 +37,23 @@ export default function App() {
   const [grocyProducts, setGrocyProducts] = useState<any[]>([]);
   const [selectedProductId, setSelectedProductId] = useState('');
   const [newProductParentId, setNewProductParentId] = useState('');
+
+  // Recipe State
+  const [recipeUrl, setRecipeUrl] = useState('');
+  const [scrapingRecipe, setScrapingRecipe] = useState(false);
+  const [scrapedRecipe, setScrapedRecipe] = useState<any>(null);
+  const [recipeSyncing, setRecipeSyncing] = useState(false);
+  const [recipeTab, setRecipeTab] = useState<'gallery' | 'mealplan' | 'scrape'>('gallery');
+  const [pendingRecipes, setPendingRecipes] = useState<any[]>([]);
+  const [recipes, setRecipes] = useState<any[]>([]);
+  const [mealPlan, setMealPlan] = useState<any[]>([]);
+  const [viewingRecipeId, setViewingRecipeId] = useState<number | null>(null);
+  const [viewingRecipe, setViewingRecipe] = useState<any>(null);
+  
+  const [recipePage, setRecipePage] = useState(1);
+  const recipesPerPage = 12;
+  const [mealPlanDays, setMealPlanDays] = useState(7);
+  const [mealPlanStartDate, setMealPlanStartDate] = useState(() => format(new Date(), 'yyyy-MM-dd'));
 
   const ignoreItem = async (id: number) => {
     try {
@@ -136,6 +153,7 @@ export default function App() {
   const [grocyUrl, setGrocyUrl] = useState('');
   const [grocyApiKey, setGrocyApiKey] = useState('');
   const [hermesWebhookUrl, setHermesWebhookUrl] = useState('');
+  const [geminiApiKey, setGeminiApiKey] = useState('');
   
   const [visionProvider, setVisionProvider] = useState('gemini');
   const [fallbackProvider, setFallbackProvider] = useState('none');
@@ -146,16 +164,41 @@ export default function App() {
   // System Status State
   const [systemStatus, setSystemStatus] = useState<any>(null);
 
+  const filteredMealPlan = useMemo(() => {
+    try {
+      const start = startOfDay(parseISO(mealPlanStartDate));
+      const end = endOfDay(addDays(start, mealPlanDays - 1));
+      return mealPlan.filter(plan => {
+        const planDate = parseISO(plan.day);
+        return isWithinInterval(planDate, { start, end });
+      }).sort((a, b) => parseISO(a.day).getTime() - parseISO(b.day).getTime());
+    } catch(e) {
+      return mealPlan;
+    }
+  }, [mealPlan, mealPlanStartDate, mealPlanDays]);
+
+  const totalRecipePages = Math.ceil(recipes.length / recipesPerPage);
+  const paginatedRecipes = useMemo(() => {
+    const start = (recipePage - 1) * recipesPerPage;
+    return recipes.slice(start, start + recipesPerPage);
+  }, [recipes, recipePage, recipesPerPage]);
+
   const fetchData = async () => {
     try {
-      const [recRes, itemRes, setRes, statusRes] = await Promise.all([
+      const [recRes, itemRes, setRes, statusRes, pendingRes, recipesRes, mealPlanRes] = await Promise.all([
         fetch('/api/receipts'),
         fetch('/api/items'),
         fetch('/api/settings'),
-        fetch('/api/status')
+        fetch('/api/status'),
+        fetch('/api/recipes/queue'),
+        fetch('/api/grocy/recipes'),
+        fetch('/api/grocy/meal_plan')
       ]);
       setReceipts(await recRes.json());
       setItems(await itemRes.json());
+      setPendingRecipes(await pendingRes.json());
+      setRecipes(await recipesRes.json());
+      setMealPlan(await mealPlanRes.json());
       const setJson = await setRes.json();
       setSettings(setJson);
       
@@ -169,6 +212,7 @@ export default function App() {
       setGrocyUrl(setJson.grocyUrl || '');
       setGrocyApiKey(setJson.grocyApiKey || '');
       setHermesWebhookUrl(setJson.hermesWebhookUrl || '');
+      setGeminiApiKey(setJson.geminiApiKey || '');
       setVisionProvider(setJson.visionProvider || 'gemini');
       setFallbackProvider(setJson.fallbackProvider || 'none');
       setCustomVisionUrl(setJson.customVisionUrl || '');
@@ -210,6 +254,88 @@ export default function App() {
     }
   };
 
+  const handleViewRecipe = async (id: number) => {
+    setViewingRecipeId(id);
+    setViewingRecipe(null); // Clear previous
+    try {
+      const res = await fetch(`/api/grocy/recipes/${id}`);
+      if (res.ok) {
+        setViewingRecipe(await res.json());
+      }
+    } catch (e) {
+      console.error(e);
+    }
+  };
+
+  const handleScrapeRecipe = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!recipeUrl) return;
+    setScrapingRecipe(true);
+    setScrapedRecipe(null);
+    try {
+      const res = await fetch('/api/recipes/scrape', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url: recipeUrl })
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setScrapedRecipe(data);
+        if (grocyProducts.length === 0) {
+          const prodRes = await fetch('/api/grocy/products');
+          if (prodRes.ok) {
+            setGrocyProducts(await prodRes.json());
+          }
+        }
+        if (quantityUnits.length === 0) {
+          const quRes = await fetch('/api/grocy/quantity_units');
+          if (quRes.ok) {
+            setQuantityUnits(await quRes.json());
+          }
+        }
+      } else {
+        const err = await res.json();
+        alert('Scraping failed: ' + err.error);
+      }
+    } catch (e) {
+      alert('Error scraping recipe');
+    } finally {
+      setScrapingRecipe(false);
+    }
+  };
+
+  const handleSyncRecipe = async () => {
+    if (!scrapedRecipe) return;
+    setRecipeSyncing(true);
+    try {
+      const res = await fetch('/api/recipes/sync', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ recipe: scrapedRecipe })
+      });
+      if (res.ok) {
+        alert('Recipe synced to Grocy!');
+        
+        // Remove from pending queue if it was there
+        const pendingMatch = pendingRecipes.find(pr => pr.url === recipeUrl);
+        if (pendingMatch) {
+          await fetch(`/api/recipes/queue/${pendingMatch.id}`, { method: 'DELETE' });
+          fetchData();
+        }
+
+        setScrapedRecipe(null);
+        setRecipeUrl('');
+      } else {
+        const err = await res.json();
+        alert('Sync failed: ' + err.error);
+      }
+    } catch (e) {
+      alert('Error syncing recipe');
+    } finally {
+      setRecipeSyncing(false);
+    }
+  };
+
   const saveSettings = async () => {
     try {
       await fetch('/api/settings', {
@@ -219,6 +345,7 @@ export default function App() {
           grocyUrl, 
           grocyApiKey, 
           hermesWebhookUrl,
+          geminiApiKey,
           visionProvider,
           fallbackProvider,
           customVisionUrl,
@@ -251,7 +378,7 @@ export default function App() {
       <header className="border-b border-neutral-800 bg-neutral-900/50 p-4">
         <div className="max-w-5xl mx-auto flex justify-between items-center">
           <h1 className="text-xl font-medium tracking-tight flex items-center gap-2">
-            <span className="text-neutral-400">Homelab</span> Receipt Manager
+            Pantry Partner
           </h1>
           <button 
             onClick={() => setSettingsOpen(true)}
@@ -300,12 +427,12 @@ export default function App() {
                   <p className="mb-2 text-sm text-neutral-400">
                     <span className="font-semibold text-neutral-300">Click to upload</span> or drag and drop
                   </p>
-                  <p className="text-xs text-neutral-500">PNG, JPG up to 10MB</p>
+                  <p className="text-xs text-neutral-500">PNG, JPG, PDF up to 10MB</p>
                 </div>
                 <input 
                   id="file-upload" 
                   type="file" 
-                  accept="image/*"
+                  accept="image/*,.pdf"
                   className="hidden" 
                   onChange={(e) => setFile(e.target.files?.[0] || null)}
                 />
@@ -346,6 +473,12 @@ export default function App() {
             onClick={() => setActiveTab('items' as any)}
           >
             <div className="flex items-center gap-2"><Check className="w-4 h-4"/> Items & Sync</div>
+          </button>
+          <button 
+            className={"px-4 py-2 border-b-2 font-medium text-sm transition-colors " + (activeTab === 'recipes' ? 'border-blue-500 text-blue-500' : 'border-transparent text-neutral-400 hover:text-neutral-200')}
+            onClick={() => setActiveTab('recipes')}
+          >
+            <div className="flex items-center gap-2"><List className="w-4 h-4"/> Recipes</div>
           </button>
         </div>
 
@@ -498,7 +631,436 @@ export default function App() {
             </div>
           </div>
         )}
+        
+        {activeTab === 'recipes' && (
+          <div className="space-y-6">
+            <div className="flex gap-4 border-b border-neutral-800 pb-2">
+              <button 
+                className={`text-sm font-medium transition-colors ${recipeTab === 'gallery' ? 'text-blue-400' : 'text-neutral-500 hover:text-neutral-300'}`}
+                onClick={() => setRecipeTab('gallery')}
+              >
+                Recipe Gallery
+              </button>
+              <button 
+                className={`text-sm font-medium transition-colors ${recipeTab === 'mealplan' ? 'text-blue-400' : 'text-neutral-500 hover:text-neutral-300'}`}
+                onClick={() => setRecipeTab('mealplan')}
+              >
+                Meal Plan
+              </button>
+              <button 
+                className={`text-sm font-medium transition-colors ${recipeTab === 'scrape' ? 'text-blue-400' : 'text-neutral-500 hover:text-neutral-300'}`}
+                onClick={() => setRecipeTab('scrape')}
+              >
+                Add/Scrape Recipe
+              </button>
+            </div>
+
+            {recipeTab === 'gallery' && (
+              <div className="space-y-6">
+                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+                  {paginatedRecipes.length === 0 ? (
+                    <div className="col-span-full text-center text-neutral-500 py-12 bg-neutral-900 rounded-xl border border-neutral-800">
+                      No recipes found. Scrape a recipe to get started.
+                    </div>
+                  ) : (
+                    paginatedRecipes.map(recipe => (
+                      <div 
+                        key={recipe.id} 
+                        className="bg-neutral-900 border border-neutral-800 rounded-xl overflow-hidden hover:border-blue-500/50 transition-colors cursor-pointer group flex flex-col"
+                        onClick={() => handleViewRecipe(recipe.id)}
+                      >
+                        {recipe.picture_file_name ? (
+                          <div className="h-48 bg-neutral-800 relative overflow-hidden">
+                            <img 
+                              src={`${settings.grocyUrl}/api/files/recipepictures/${btoa(recipe.picture_file_name)}`} 
+                              alt={recipe.name}
+                              className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-500"
+                              onError={(e) => {
+                                 e.currentTarget.style.display = 'none';
+                              }}
+                            />
+                          </div>
+                        ) : (
+                          <div className="h-48 bg-neutral-800 flex items-center justify-center">
+                            <List className="w-12 h-12 text-neutral-600" />
+                          </div>
+                        )}
+                        <div className="p-4 flex-1 flex flex-col">
+                          <h3 className="text-lg font-medium text-neutral-100 mb-1">{recipe.name}</h3>
+                          <div className="text-xs text-neutral-500 mb-4 line-clamp-3" dangerouslySetInnerHTML={{ __html: recipe.description || '' }} />
+                          <div className="mt-auto flex items-center gap-4 text-xs text-neutral-400">
+                            {recipe.base_servings && <span>{recipe.base_servings} Servings</span>}
+                          </div>
+                        </div>
+                      </div>
+                    ))
+                  )}
+                </div>
+
+                {totalRecipePages > 1 && (
+                  <div className="flex justify-center items-center gap-4 pt-6 border-t border-neutral-800">
+                    <button
+                      className="p-2 text-neutral-400 hover:text-neutral-100 disabled:opacity-50 disabled:hover:text-neutral-400"
+                      disabled={recipePage === 1}
+                      onClick={() => setRecipePage(p => Math.max(1, p - 1))}
+                    >
+                      <ChevronLeft className="w-5 h-5" />
+                    </button>
+                    <span className="text-sm text-neutral-400">
+                      Page <span className="text-neutral-200 font-medium">{recipePage}</span> of {totalRecipePages}
+                    </span>
+                    <button
+                      className="p-2 text-neutral-400 hover:text-neutral-100 disabled:opacity-50 disabled:hover:text-neutral-400"
+                      disabled={recipePage === totalRecipePages}
+                      onClick={() => setRecipePage(p => Math.min(totalRecipePages, p + 1))}
+                    >
+                      <ChevronRight className="w-5 h-5" />
+                    </button>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {recipeTab === 'mealplan' && (
+              <div className="bg-neutral-900 border border-neutral-800 rounded-xl overflow-hidden">
+                <div className="p-6 border-b border-neutral-800 flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4">
+                  <div>
+                    <h2 className="text-lg font-medium text-neutral-100">Meal Plan</h2>
+                    <p className="text-sm text-neutral-400">View your planned meals from Grocy.</p>
+                  </div>
+                  <div className="flex items-center gap-3 bg-neutral-950 p-2 rounded-lg border border-neutral-800">
+                    <input 
+                      type="date"
+                      value={mealPlanStartDate}
+                      onChange={e => setMealPlanStartDate(e.target.value)}
+                      className="bg-transparent text-sm text-neutral-200 border-none outline-none focus:ring-0 custom-date-input"
+                    />
+                    <div className="w-px h-4 bg-neutral-700"></div>
+                    <select
+                      value={mealPlanDays}
+                      onChange={e => setMealPlanDays(Number(e.target.value))}
+                      className="bg-transparent text-sm text-neutral-200 border-none outline-none focus:ring-0"
+                    >
+                      <option value={1} className="bg-neutral-900 text-neutral-200">1 Day</option>
+                      <option value={3} className="bg-neutral-900 text-neutral-200">3 Days</option>
+                      <option value={7} className="bg-neutral-900 text-neutral-200">7 Days</option>
+                      <option value={14} className="bg-neutral-900 text-neutral-200">14 Days</option>
+                      <option value={30} className="bg-neutral-900 text-neutral-200">30 Days</option>
+                    </select>
+                  </div>
+                </div>
+                <div className="p-6">
+                  {filteredMealPlan.length === 0 ? (
+                    <div className="text-center text-neutral-500 py-12">
+                      No meals planned for this timeframe.
+                    </div>
+                  ) : (
+                    <div className="space-y-4">
+                      {filteredMealPlan.map(plan => {
+                        const recipe = recipes.find(r => r.id === plan.recipe_id);
+                        return (
+                          <div key={plan.id} className="flex items-center gap-4 bg-neutral-950 p-4 rounded-lg border border-neutral-800">
+                            <div className="w-24 text-center">
+                              <div className="text-xs text-neutral-500 uppercase font-medium">{format(parseISO(plan.day), 'EEE')}</div>
+                              <div className="text-xl text-neutral-200">{format(parseISO(plan.day), 'd')}</div>
+                            </div>
+                            <div className="w-px h-12 bg-neutral-800"></div>
+                            <div className="flex-1">
+                              <h4 className="text-neutral-200 font-medium">{recipe ? recipe.name : 'Unknown Recipe'}</h4>
+                              {plan.recipe_servings && <p className="text-xs text-neutral-500">{plan.recipe_servings} Servings</p>}
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
+
+            {recipeTab === 'scrape' && (
+              <div className="space-y-6">
+                <div className="bg-neutral-900 border border-neutral-800 rounded-xl p-6">
+                  <h2 className="text-lg font-medium text-neutral-100 mb-2">API Documentation: Add Recipes to Queue</h2>
+                  <p className="text-sm text-neutral-400 mb-4">
+                    You or your AI agents can programmatically queue recipe URLs to be processed later.
+                  </p>
+                  <div className="bg-neutral-950 p-4 rounded-md font-mono text-xs text-neutral-300">
+                    <div className="mb-2"><span className="text-blue-400 font-bold">POST</span> /api/recipes/queue</div>
+                    <div className="text-neutral-500 mb-1">Headers:</div>
+                    <div className="ml-4 mb-2">Content-Type: application/json</div>
+                    <div className="text-neutral-500 mb-1">Body:</div>
+                    <div className="ml-4">{`{ "url": "https://example.com/recipe-url" }`}</div>
+                  </div>
+                </div>
+
+                {pendingRecipes.length > 0 && (
+                  <div className="bg-neutral-900 border border-neutral-800 rounded-xl p-6">
+                    <h2 className="text-lg font-medium text-neutral-100 mb-4">Pending Recipe URLs (From API)</h2>
+                <div className="space-y-2">
+                  {pendingRecipes.map((pr: any) => (
+                    <div key={pr.id} className="flex items-center justify-between bg-neutral-950 p-3 rounded-md border border-neutral-800">
+                      <span className="text-sm text-neutral-300 truncate max-w-[70%]">{pr.url}</span>
+                      <div className="flex gap-2">
+                        <button 
+                          className="px-3 py-1 bg-blue-600/20 text-blue-400 rounded hover:bg-blue-600/40 text-xs transition-colors"
+                          onClick={() => setRecipeUrl(pr.url)}
+                        >
+                          Use URL
+                        </button>
+                        <button 
+                          className="px-3 py-1 bg-red-900/20 text-red-400 rounded hover:bg-red-900/40 text-xs transition-colors"
+                          onClick={async () => {
+                            await fetch(`/api/recipes/queue/${pr.id}`, { method: 'DELETE' });
+                            fetchData();
+                          }}
+                        >
+                          Delete
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            <div className="bg-neutral-900 border border-neutral-800 rounded-xl p-6">
+              <h2 className="text-lg font-medium text-neutral-100 mb-4">Scrape Recipe</h2>
+              <form onSubmit={handleScrapeRecipe} className="flex gap-4">
+                <input
+                  type="url"
+                  placeholder="Paste recipe URL here..."
+                  value={recipeUrl}
+                  onChange={(e) => setRecipeUrl(e.target.value)}
+                  className="flex-1 bg-neutral-800 border border-neutral-700 rounded-md px-4 py-2 text-sm text-neutral-200 focus:outline-none focus:border-blue-500"
+                  required
+                />
+                <button
+                  type="submit"
+                  disabled={scrapingRecipe || !recipeUrl}
+                  className="bg-blue-600 hover:bg-blue-700 text-white px-6 py-2 rounded-md font-medium flex items-center gap-2 transition-colors disabled:opacity-50"
+                >
+                  {scrapingRecipe ? <Loader2 className="w-4 h-4 animate-spin" /> : <List className="w-4 h-4" />}
+                  {scrapingRecipe ? 'Scraping...' : 'Scrape Recipe'}
+                </button>
+              </form>
+            </div>
+
+            {scrapedRecipe && (
+              <div className="bg-neutral-900 border border-neutral-800 rounded-xl p-6">
+                <div className="flex justify-between items-start mb-6">
+                  <div className="flex gap-4">
+                    {scrapedRecipe.imageUrl && (
+                      <img src={scrapedRecipe.imageUrl} alt={scrapedRecipe.name} className="w-24 h-24 object-cover rounded-lg" />
+                    )}
+                    <div>
+                      <h2 className="text-xl font-medium text-neutral-100 mb-1">{scrapedRecipe.name}</h2>
+                      <p className="text-sm text-neutral-400">{scrapedRecipe.description}</p>
+                    </div>
+                  </div>
+                  <button
+                    onClick={handleSyncRecipe}
+                    disabled={recipeSyncing}
+                    className="bg-green-600 hover:bg-green-700 text-white px-6 py-2 rounded-md font-medium flex items-center gap-2 transition-colors disabled:opacity-50"
+                  >
+                    {recipeSyncing ? <Loader2 className="w-4 h-4 animate-spin" /> : <Check className="w-4 h-4" />}
+                    {recipeSyncing ? 'Syncing...' : 'Sync to Grocy'}
+                  </button>
+                </div>
+                
+                <div className="space-y-4">
+                  <h3 className="font-medium text-neutral-200">Ingredients</h3>
+                  <datalist id="grocy-products-list">
+                    {grocyProducts.map((p: any) => (
+                      <option key={p.id} value={p.name} />
+                    ))}
+                  </datalist>
+                  <datalist id="grocy-units-list">
+                    {quantityUnits.map((qu: any) => (
+                      <option key={qu.id} value={qu.name} />
+                    ))}
+                  </datalist>
+                  <div className="bg-neutral-950 rounded-lg p-4 space-y-3">
+                    {scrapedRecipe.ingredients?.map((ing: any, idx: number) => (
+                      <div key={idx} className="flex justify-between items-center text-sm border-b border-neutral-800 pb-2 last:border-0 last:pb-0 gap-4">
+                        <div className="flex-1">
+                          <span className="text-neutral-300 font-medium">{ing.originalString || ing.name}</span>
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <input 
+                            type="number" 
+                            step="0.01"
+                            className="bg-neutral-800 border border-neutral-700 rounded-md px-2 py-1.5 w-20 text-xs text-neutral-200 focus:outline-none focus:border-blue-500" 
+                            value={ing.amount || ''} 
+                            onChange={(e) => {
+                              const newProds = [...(scrapedRecipe.ingredients || [])];
+                              newProds[idx].amount = Number(e.target.value);
+                              setScrapedRecipe({ ...scrapedRecipe, ingredients: newProds });
+                            }}
+                          />
+                          <input 
+                            list="grocy-units-list"
+                            type="text" 
+                            placeholder="Unit (Grocy)"
+                            className="bg-neutral-800 border border-neutral-700 rounded-md px-2 py-1.5 w-24 text-xs text-neutral-200 focus:outline-none focus:border-blue-500" 
+                            value={ing.selectedQuName !== undefined ? ing.selectedQuName : ing.unit || ''} 
+                            onChange={(e) => {
+                              const newProds = [...(scrapedRecipe.ingredients || [])];
+                              const val = e.target.value;
+                              newProds[idx].unit = val;
+                              newProds[idx].selectedQuName = val;
+                              const quMatch = quantityUnits.find(qu => qu.name === val);
+                              if (quMatch) {
+                                newProds[idx].selectedQuId = quMatch.id;
+                              } else {
+                                newProds[idx].selectedQuId = null;
+                              }
+                              setScrapedRecipe({ ...scrapedRecipe, ingredients: newProds });
+                            }}
+                          />
+                          <input
+                            list="grocy-products-list"
+                            type="text"
+                            placeholder="Match Product..."
+                            value={ing.grocyMatch?.name || ing.grocyMatchText || ''}
+                            onChange={(e) => {
+                              const newProds = [...(scrapedRecipe.ingredients || [])];
+                              const val = e.target.value;
+                              newProds[idx].grocyMatchText = val;
+                              const match = grocyProducts.find(p => p.name === val);
+                              if (match) {
+                                newProds[idx].grocyMatch = match;
+                                // Try to auto-select matching unit if found
+                                if (!newProds[idx].selectedQuId) {
+                                  const defaultQu = quantityUnits.find(qu => qu.id === match.qu_id_stock);
+                                  if (defaultQu) {
+                                    newProds[idx].selectedQuId = defaultQu.id;
+                                    newProds[idx].selectedQuName = defaultQu.name;
+                                    newProds[idx].unit = defaultQu.name;
+                                  }
+                                }
+                              } else {
+                                newProds[idx].grocyMatch = null;
+                              }
+                              setScrapedRecipe({ ...scrapedRecipe, ingredients: newProds });
+                            }}
+                            className="bg-neutral-800 border border-neutral-700 rounded-md px-2 py-1.5 text-xs text-neutral-200 w-[200px] focus:outline-none focus:border-blue-500"
+                          />
+                          {ing.grocyMatch ? (
+                            <span className="text-green-400 text-xs flex items-center justify-center w-6">
+                              <Check className="w-4 h-4" />
+                            </span>
+                          ) : (
+                            <span className="text-yellow-500 text-xs flex items-center justify-center w-6" title="Unbound">
+                              -
+                            </span>
+                          )}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            )}
+            </div>
+            )}
+          </div>
+        )}
       </main>
+
+      {/* Recipe View Modal */}
+      {viewingRecipeId && (
+        <div className="fixed inset-0 bg-black/80 backdrop-blur-sm z-50 flex items-center justify-center p-4 sm:p-6" onClick={() => setViewingRecipeId(null)}>
+          <div 
+            className="bg-neutral-900 border border-neutral-800 rounded-2xl w-full max-w-4xl max-h-[90vh] overflow-hidden flex flex-col shadow-2xl" 
+            onClick={(e) => e.stopPropagation()}
+          >
+            {!viewingRecipe ? (
+              <div className="flex-1 flex items-center justify-center p-12">
+                <Loader2 className="w-8 h-8 text-blue-500 animate-spin" />
+              </div>
+            ) : (
+              <>
+                <div className="relative h-64 sm:h-80 bg-neutral-800 shrink-0">
+                  {viewingRecipe.picture_file_name ? (
+                    <img 
+                      src={`${settings.grocyUrl}/api/files/recipepictures/${btoa(viewingRecipe.picture_file_name)}`} 
+                      alt={viewingRecipe.name}
+                      className="w-full h-full object-cover"
+                      onError={(e) => { e.currentTarget.style.display = 'none'; }}
+                    />
+                  ) : (
+                    <div className="w-full h-full flex items-center justify-center">
+                      <List className="w-16 h-16 text-neutral-600" />
+                    </div>
+                  )}
+                  <div className="absolute inset-0 bg-gradient-to-t from-neutral-900 via-neutral-900/40 to-transparent"></div>
+                  <button 
+                    onClick={() => setViewingRecipeId(null)}
+                    className="absolute top-4 right-4 bg-black/50 hover:bg-black/80 text-white rounded-full p-2 backdrop-blur transition-colors"
+                  >
+                    <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>
+                  </button>
+                  <div className="absolute bottom-0 left-0 right-0 p-6 sm:p-8">
+                    <h2 className="text-3xl sm:text-4xl font-bold text-white mb-2">{viewingRecipe.name}</h2>
+                    {viewingRecipe.base_servings && (
+                      <div className="inline-flex items-center gap-2 px-3 py-1 bg-white/10 backdrop-blur rounded-full text-sm font-medium text-white">
+                        <PieChartIcon className="w-4 h-4" /> {viewingRecipe.base_servings} Servings
+                      </div>
+                    )}
+                  </div>
+                </div>
+                
+                <div className="flex-1 overflow-y-auto custom-scrollbar p-6 sm:p-8 bg-neutral-900">
+                  <div className="grid grid-cols-1 lg:grid-cols-3 gap-8 sm:gap-12">
+                    <div className="lg:col-span-1 space-y-8">
+                      <div>
+                        <h3 className="text-lg font-semibold text-neutral-100 mb-4 flex items-center gap-2">
+                          Ingredients
+                        </h3>
+                        {viewingRecipe.positions && viewingRecipe.positions.length > 0 ? (
+                          <ul className="space-y-3">
+                            {viewingRecipe.positions.map((pos: any) => {
+                              const product = grocyProducts.find(p => p.id === pos.product_id);
+                              const qu = quantityUnits.find(q => q.id === pos.qu_id);
+                              return (
+                                <li key={pos.id} className="flex justify-between items-start border-b border-neutral-800/50 pb-2 last:border-0">
+                                  <span className="text-neutral-300 font-medium">{product ? product.name : `Product ID: ${pos.product_id}`}</span>
+                                  <span className="text-neutral-500 text-sm whitespace-nowrap ml-4">
+                                    {pos.amount} {qu ? qu.name : ''}
+                                  </span>
+                                </li>
+                              );
+                            })}
+                          </ul>
+                        ) : (
+                          <p className="text-neutral-500 text-sm">No ingredients listed.</p>
+                        )}
+                      </div>
+                    </div>
+                    
+                    <div className="lg:col-span-2 space-y-8">
+                      <div>
+                        <h3 className="text-lg font-semibold text-neutral-100 mb-4 flex items-center gap-2">
+                          Instructions
+                        </h3>
+                        {viewingRecipe.description ? (
+                          <div 
+                            className="prose prose-invert prose-neutral max-w-none text-neutral-300 leading-relaxed marker:text-neutral-500 prose-a:text-blue-400 hover:prose-a:text-blue-300"
+                            dangerouslySetInnerHTML={{ __html: viewingRecipe.description }}
+                          />
+                        ) : (
+                          <p className="text-neutral-500 text-sm italic">No instructions provided.</p>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </>
+            )}
+          </div>
+        </div>
+      )}
 
       {/* Sync Item Modal */}
       {syncItemModalOpen && itemToSync && (
@@ -733,6 +1295,17 @@ export default function App() {
                     value={hermesWebhookUrl}
                     onChange={e => setHermesWebhookUrl(e.target.value)}
                     placeholder="http://hermes.local/webhook"
+                    className="w-full bg-neutral-800 border border-neutral-700 rounded-md px-3 py-2 text-sm text-neutral-200 focus:outline-none focus:border-blue-500"
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-sm font-medium text-neutral-400 mb-1">Gemini API Key (Optional)</label>
+                  <input 
+                    type="password" 
+                    value={geminiApiKey}
+                    onChange={e => setGeminiApiKey(e.target.value)}
+                    placeholder="AI Studio API Key"
                     className="w-full bg-neutral-800 border border-neutral-700 rounded-md px-3 py-2 text-sm text-neutral-200 focus:outline-none focus:border-blue-500"
                   />
                 </div>

@@ -1,6 +1,6 @@
 {
-  "name": "Homelab Receipt & Inventory Manager",
-  "description": "Upload receipts, categorize them for monthly budget tracking, push items to grocy API, and notify hermes agents.",
+  "name": "Pantry Partner",
+  "description": "Upload receipts for budget tracking, push inventory to Grocy, notify Hermes agents, and scrape recipes directly into Grocy with fuzzy ingredient matching.",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }

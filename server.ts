@@ -55,6 +55,14 @@ async function setupDb() {
   try { await db.execute("ALTER TABLE receipt_items ADD COLUMN ignored INTEGER DEFAULT 0"); } catch (e) {}
 
   await db.execute(`
+    CREATE TABLE IF NOT EXISTS pending_recipes (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      url TEXT NOT NULL,
+      createdAt DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+
+  await db.execute(`
     CREATE TABLE IF NOT EXISTS settings (
       key TEXT PRIMARY KEY,
       value TEXT
@@ -70,11 +78,24 @@ async function startServer() {
 
   // Fetch Settings Helper
   const getSettings = async () => {
-    const result = await db.execute("SELECT * FROM settings");
-    return result.rows.reduce((acc: any, row: any) => {
-      acc[row.key] = row.value;
-      return acc;
-    }, {});
+    let envConfig: Record<string, string> = {};
+    try {
+      if (fs.existsSync(".env")) {
+         envConfig = dotenv.parse(fs.readFileSync(".env"));
+      }
+    } catch(e) {}
+    
+    return {
+      grocyUrl: envConfig.GROCY_URL ?? process.env.GROCY_URL ?? "",
+      grocyApiKey: envConfig.GROCY_API_KEY ?? process.env.GROCY_API_KEY ?? "",
+      hermesWebhookUrl: envConfig.HERMES_WEBHOOK_URL ?? process.env.HERMES_WEBHOOK_URL ?? "",
+      visionProvider: envConfig.VISION_PROVIDER ?? process.env.VISION_PROVIDER ?? "gemini",
+      fallbackProvider: envConfig.FALLBACK_PROVIDER ?? process.env.FALLBACK_PROVIDER ?? "none",
+      customVisionUrl: envConfig.CUSTOM_VISION_URL ?? process.env.CUSTOM_VISION_URL ?? "",
+      customVisionApiKey: envConfig.CUSTOM_VISION_API_KEY ?? process.env.CUSTOM_VISION_API_KEY ?? "",
+      customVisionModel: envConfig.CUSTOM_VISION_MODEL ?? process.env.CUSTOM_VISION_MODEL ?? "",
+      geminiApiKey: envConfig.GEMINI_API_KEY ?? process.env.GEMINI_API_KEY ?? ""
+    };
   };
 
   const getGrocyBaseUrl = (url: string) => {
@@ -90,12 +111,7 @@ async function startServer() {
   // GET Settings
   app.get("/api/settings", async (req, res) => {
     try {
-      const result = await db.execute("SELECT * FROM settings");
-      const settings = result.rows.reduce((acc: any, row: any) => {
-        acc[row.key] = row.value;
-        return acc;
-      }, {});
-      res.json(settings);
+      res.json(await getSettings());
     } catch (err) {
       console.error(err);
       res.status(500).json({ error: "Failed to fetch settings" });
@@ -113,28 +129,32 @@ async function startServer() {
         fallbackProvider,
         customVisionUrl,
         customVisionApiKey,
-        customVisionModel
+        customVisionModel,
+        geminiApiKey
       } = req.body;
       
-      const settingsToSave = { 
-        grocyUrl, 
-        grocyApiKey, 
-        hermesWebhookUrl,
-        visionProvider,
-        fallbackProvider,
-        customVisionUrl,
-        customVisionApiKey,
-        customVisionModel 
-      };
-      
-      for (const [key, value] of Object.entries(settingsToSave)) {
-        if (value !== undefined) {
-          await db.execute({
-            sql: "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = ?",
-            args: [key, value as string, value as string]
-          });
-        }
+      let envConfig: Record<string, string> = {};
+      if (fs.existsSync(".env")) {
+        envConfig = dotenv.parse(fs.readFileSync(".env"));
       }
+
+      if (grocyUrl !== undefined) envConfig.GROCY_URL = grocyUrl;
+      if (grocyApiKey !== undefined) envConfig.GROCY_API_KEY = grocyApiKey;
+      if (hermesWebhookUrl !== undefined) envConfig.HERMES_WEBHOOK_URL = hermesWebhookUrl;
+      if (visionProvider !== undefined) envConfig.VISION_PROVIDER = visionProvider;
+      if (fallbackProvider !== undefined) envConfig.FALLBACK_PROVIDER = fallbackProvider;
+      if (customVisionUrl !== undefined) envConfig.CUSTOM_VISION_URL = customVisionUrl;
+      if (customVisionApiKey !== undefined) envConfig.CUSTOM_VISION_API_KEY = customVisionApiKey;
+      if (customVisionModel !== undefined) envConfig.CUSTOM_VISION_MODEL = customVisionModel;
+      if (geminiApiKey !== undefined) envConfig.GEMINI_API_KEY = geminiApiKey;
+
+      let newEnvContent = "";
+      for (const [k, v] of Object.entries(envConfig)) {
+        newEnvContent += `${k}="${v.replace(/"/g, '\\"')}"\n`;
+        process.env[k] = v;
+      }
+      fs.writeFileSync(".env", newEnvContent);
+
       res.json({ success: true });
     } catch (err) {
       console.error(err);
@@ -289,6 +309,7 @@ async function startServer() {
           return JSON.parse(response.text);
         } else if (provider === 'custom') {
           if (!customVisionUrl || !customVisionApiKey) throw new Error("Custom Vision API settings missing");
+          if (mimeType === 'application/pdf') throw new Error("Custom Vision provider does not support PDF files natively via image_url. Please use Gemini for PDF parsing.");
           const response = await fetch(`${customVisionUrl}/chat/completions`, {
             method: 'POST',
             headers: {
@@ -440,6 +461,73 @@ async function startServer() {
     }
   });
 
+  app.get("/api/grocy/recipes", async (req, res) => {
+    try {
+      const settings = await getSettings();
+      if (!settings.grocyUrl || !settings.grocyApiKey) return res.json([]);
+      const baseUrl = getGrocyBaseUrl(settings.grocyUrl);
+      const gRes = await fetch(`${baseUrl}/api/objects/recipes`, {
+        headers: { 'GROCY-API-KEY': settings.grocyApiKey }
+      });
+      if (!gRes.ok) return res.json([]);
+      res.json(await gRes.json());
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.get("/api/grocy/recipes/:id", async (req, res) => {
+    try {
+      const settings = await getSettings();
+      if (!settings.grocyUrl || !settings.grocyApiKey) return res.status(400).json({ error: "Grocy not configured" });
+      const baseUrl = getGrocyBaseUrl(settings.grocyUrl);
+      
+      const [recipeRes, posRes] = await Promise.all([
+        fetch(`${baseUrl}/api/objects/recipes/${req.params.id}`, { headers: { 'GROCY-API-KEY': settings.grocyApiKey } }),
+        fetch(`${baseUrl}/api/objects/recipes_pos?query[]=recipe_id=${req.params.id}`, { headers: { 'GROCY-API-KEY': settings.grocyApiKey } })
+      ]);
+      
+      if (!recipeRes.ok) return res.status(404).json({ error: "Recipe not found" });
+      
+      const recipe = await recipeRes.json();
+      const positions = posRes.ok ? await posRes.json() : [];
+      
+      res.json({ ...recipe, positions });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.get("/api/grocy/meal_plan", async (req, res) => {
+    try {
+      const settings = await getSettings();
+      if (!settings.grocyUrl || !settings.grocyApiKey) return res.json([]);
+      const baseUrl = getGrocyBaseUrl(settings.grocyUrl);
+      const gRes = await fetch(`${baseUrl}/api/objects/meal_plan`, {
+        headers: { 'GROCY-API-KEY': settings.grocyApiKey }
+      });
+      if (!gRes.ok) return res.json([]);
+      res.json(await gRes.json());
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.get("/api/grocy/quantity_units", async (req, res) => {
+    try {
+      const settings = await getSettings();
+      if (!settings.grocyUrl || !settings.grocyApiKey) return res.json([]);
+      const baseUrl = getGrocyBaseUrl(settings.grocyUrl);
+      const quRes = await fetch(`${baseUrl}/api/objects/quantity_units`, {
+        headers: { 'GROCY-API-KEY': settings.grocyApiKey }
+      });
+      if (!quRes.ok) return res.json([]);
+      res.json(await quRes.json());
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
   app.post("/api/items/:id/sync", async (req, res) => {
     try {
       const itemId = req.params.id;
@@ -512,11 +600,37 @@ async function startServer() {
       }
 
       // Add to stock
+      let stockAmount = amount;
+      if (quFactorPurchaseToStock) {
+        stockAmount = amount * Number(quFactorPurchaseToStock);
+      } else if (finalProductId) {
+        try {
+          const pRes = await fetch(`${baseUrl}/api/objects/products/${finalProductId}`, {
+            headers: { 'GROCY-API-KEY': grocyApiKey }
+          });
+          if (pRes.ok) {
+            const p = await pRes.json();
+            const convRes = await fetch(`${baseUrl}/api/objects/quantity_unit_conversions?query[]=product_id=${finalProductId}`, {
+               headers: { 'GROCY-API-KEY': grocyApiKey }
+            });
+            if (convRes.ok) {
+               const convs = await convRes.json();
+               const conv = convs.find((c: any) => Number(c.from_qu_id) === Number(p.qu_id_purchase) && Number(c.to_qu_id) === Number(p.qu_id_stock));
+               if (conv && conv.factor) {
+                  stockAmount = amount * Number(conv.factor);
+               }
+            }
+          }
+        } catch (e) {
+          console.error("Failed to fetch product for factor:", e);
+        }
+      }
+
       const addRes = await fetch(`${baseUrl}/api/stock/products/${finalProductId}/add`, {
         method: 'POST',
         headers: { 'GROCY-API-KEY': grocyApiKey, 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          amount: amount,
+          amount: stockAmount,
           price: price,
           transaction_type: 'purchase'
         })
@@ -566,7 +680,258 @@ async function startServer() {
     }
   });
 
-  // Vite middleware for development
+  // Pending Recipes Queue Endpoints
+  app.get("/api/recipes/queue", async (req, res) => {
+    try {
+      const result = await db.execute("SELECT * FROM pending_recipes ORDER BY createdAt DESC");
+      res.json(result.rows);
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.post("/api/recipes/queue", async (req, res) => {
+    try {
+      const { url } = req.body;
+      if (!url) return res.status(400).json({ error: "No URL provided" });
+      await db.execute({
+        sql: "INSERT INTO pending_recipes (url) VALUES (?)",
+        args: [url]
+      });
+      res.json({ success: true });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.delete("/api/recipes/queue/:id", async (req, res) => {
+    try {
+      await db.execute({
+        sql: "DELETE FROM pending_recipes WHERE id = ?",
+        args: [req.params.id]
+      });
+      res.json({ success: true });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.post("/api/recipes/scrape", async (req, res) => {
+    try {
+      const { url } = req.body;
+      if (!url) return res.status(400).json({ error: "No URL provided" });
+
+      const settings = await getSettings();
+      if (!process.env.GEMINI_API_KEY) {
+        return res.status(400).json({ error: "Gemini API Key missing" });
+      }
+
+      // Fetch URL content using Jina Reader for better parsing and bypassing some bot protections
+      const urlRes = await fetch(`https://r.jina.ai/${url}`, {
+        headers: {
+          'Accept': 'application/json',
+          'X-Return-Format': 'markdown'
+        }
+      });
+      
+      let contentToParse = "";
+      if (urlRes.ok) {
+        const jinaData = await urlRes.json();
+        contentToParse = jinaData.data?.content || jinaData.data?.text || "";
+      } else {
+        // Fallback to normal fetch
+        const fbRes = await fetch(url, {
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+          }
+        });
+        const html = await fbRes.text();
+        const ldJsonMatches = html.match(/<script[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi);
+        let extractedLdJson = "";
+        if (ldJsonMatches) {
+          extractedLdJson = ldJsonMatches.join("\n");
+        }
+        contentToParse = extractedLdJson + "\n\n" + html.replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, '');
+      }
+
+      // Ask Gemini to extract
+      const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+      const response = await ai.models.generateContent({
+        model: "gemini-2.5-pro",
+        contents: [
+          { role: "user", parts: [{ text: `Extract the recipe from this content. Provide a JSON object with 'name' (string), 'description' (string), 'imageUrl' (string, optional), 'ingredients' (array of objects with 'originalString' (string, exactly as written in the recipe), 'name' (string), 'amount' (number), 'unit' (string)), and 'instructions' (string, markdown formatted).\n\nIf no recipe is found, return empty fields.\n\nContent:\n${contentToParse.substring(0, 100000)}` }] }
+        ],
+        config: {
+          responseMimeType: "application/json",
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              name: { type: Type.STRING },
+              description: { type: Type.STRING },
+              imageUrl: { type: Type.STRING, description: "URL to the recipe image" },
+              ingredients: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    originalString: { type: Type.STRING },
+                    name: { type: Type.STRING },
+                    amount: { type: Type.NUMBER },
+                    unit: { type: Type.STRING }
+                  }
+                }
+              },
+              instructions: { type: Type.STRING }
+            }
+          }
+        }
+      });
+
+      const parsedRecipe = JSON.parse(response.text);
+
+      // Fuzzy match ingredients with Grocy
+      if (settings.grocyUrl && settings.grocyApiKey) {
+        const baseUrl = getGrocyBaseUrl(settings.grocyUrl);
+        const prodsRes = await fetch(`${baseUrl}/api/objects/products`, { headers: { 'GROCY-API-KEY': settings.grocyApiKey } });
+        if (prodsRes.ok) {
+          const products = await prodsRes.json();
+          if (parsedRecipe && Array.isArray(parsedRecipe.ingredients)) {
+            for (const ing of parsedRecipe.ingredients) {
+              const match = products.find((p: any) => 
+                p.name.toLowerCase().includes(ing.name.toLowerCase()) || 
+                ing.name.toLowerCase().includes(p.name.toLowerCase())
+              );
+              if (match) {
+                ing.grocyMatch = match;
+              }
+            }
+          }
+        }
+      }
+
+      res.json(parsedRecipe);
+    } catch (e: any) {
+      console.error(e);
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.post("/api/recipes/sync", async (req, res) => {
+    try {
+      const { recipe } = req.body;
+      const settings = await getSettings();
+      if (!settings.grocyUrl || !settings.grocyApiKey) return res.status(400).json({ error: "Grocy not configured" });
+      const baseUrl = getGrocyBaseUrl(settings.grocyUrl);
+
+      let pictureFileName = null;
+      if (recipe.imageUrl) {
+        try {
+          const imgRes = await fetch(recipe.imageUrl);
+          if (imgRes.ok) {
+            const arrayBuffer = await imgRes.arrayBuffer();
+            const buffer = Buffer.from(arrayBuffer);
+            pictureFileName = `recipe_${Date.now()}.jpg`;
+            const uploadRes = await fetch(`${baseUrl}/api/files/recipepictures/${Buffer.from(pictureFileName).toString('base64')}`, {
+              method: 'PUT',
+              headers: { 
+                'GROCY-API-KEY': settings.grocyApiKey,
+                'Content-Type': 'application/octet-stream'
+              },
+              body: buffer
+            });
+            if (!uploadRes.ok) {
+              console.error("Failed to upload image", await uploadRes.text());
+              pictureFileName = null;
+            }
+          }
+        } catch (e) {
+          console.error("Error uploading image:", e);
+        }
+      }
+
+      // Create Recipe
+      const createRes = await fetch(`${baseUrl}/api/objects/recipes`, {
+        method: 'POST',
+        headers: { 'GROCY-API-KEY': settings.grocyApiKey, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: recipe.name,
+          description: recipe.instructions, // Put instructions in description
+          base_servings: 1, // Default
+          desired_servings: 1,
+          picture_file_name: pictureFileName || undefined
+        })
+      });
+
+      if (!createRes.ok) throw new Error(`Failed to create recipe: ${await createRes.text()}`);
+      const createdRecipe = await createRes.json();
+      const recipeId = createdRecipe.created_object_id || createdRecipe.id;
+
+      // Add Ingredients
+      let defaultLocationId: number | null = null;
+      let defaultQuId: number | null = null;
+
+      for (const ing of recipe.ingredients) {
+        let productId = ing.grocyMatch?.id;
+        let quId = ing.selectedQuId || ing.grocyMatch?.qu_id_stock;
+
+        // If no match was found, create a new product
+        if (!productId) {
+          if (!defaultLocationId) {
+            const locRes = await fetch(`${baseUrl}/api/objects/locations`, { headers: { 'GROCY-API-KEY': settings.grocyApiKey }});
+            const locs = locRes.ok ? await locRes.json() : [];
+            defaultLocationId = locs.length > 0 ? locs[0].id : 1;
+          }
+          if (!defaultQuId) {
+            const quRes = await fetch(`${baseUrl}/api/objects/quantity_units`, { headers: { 'GROCY-API-KEY': settings.grocyApiKey }});
+            const qus = quRes.ok ? await quRes.json() : [];
+            defaultQuId = qus.length > 0 ? qus[0].id : 1;
+          }
+
+          // Use grocyMatchText (from the search field) if user typed something but didn't select, otherwise name, otherwise originalString
+          const newProductName = ing.grocyMatchText || ing.name || ing.originalString || "Unknown Ingredient";
+          const prodQuId = ing.selectedQuId || defaultQuId;
+
+          const prodCreateRes = await fetch(`${baseUrl}/api/objects/products`, {
+            method: 'POST',
+            headers: { 'GROCY-API-KEY': settings.grocyApiKey, 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              name: newProductName,
+              location_id: defaultLocationId,
+              qu_id_purchase: prodQuId,
+              qu_id_stock: prodQuId
+            })
+          });
+
+          if (prodCreateRes.ok) {
+            const createdProd = await prodCreateRes.json();
+            productId = createdProd.created_object_id || createdProd.id;
+            quId = prodQuId;
+          } else {
+            console.error("Failed to create product for ingredient", newProductName, await prodCreateRes.text());
+          }
+        }
+
+        if (productId) {
+          await fetch(`${baseUrl}/api/objects/recipes_pos`, {
+            method: 'POST',
+            headers: { 'GROCY-API-KEY': settings.grocyApiKey, 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              recipe_id: recipeId,
+              product_id: productId,
+              amount: ing.amount || 1, // Default to 1 if amount is missing
+              qu_id: quId, 
+              only_check_single_unit_in_stock: 0
+            })
+          });
+        }
+      }
+
+      res.json({ success: true, recipeId });
+    } catch (e: any) {
+      console.error(e);
+      res.status(500).json({ error: e.message });
+    }
+  });
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
       server: { middlewareMode: true },

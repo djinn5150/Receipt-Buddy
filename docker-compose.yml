@@ -6,9 +6,10 @@ services:
     container_name: receipt-manager
     ports:
       - "3000:3000"
-    environment:
-      - GEMINI_API_KEY=${GEMINI_API_KEY}
+    env_file:
+      - .env
     volumes:
       - ./data:/app/data
       - ./uploads:/app/uploads
+      - ./.env:/app/.env
     restart: unless-stopped
