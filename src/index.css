@@ -10,10 +10,20 @@
 @layer base {
   :root {
     --bg: #f8f7f4;
+    --surface: #ffffff;
     --ink: #1a1a1a;
     --accent: #5e6d5a;
     --ink-faint: rgba(26, 26, 26, 0.08);
     --ink-medium: rgba(26, 26, 26, 0.6);
+  }
+
+  .dark {
+    --bg: #111111;
+    --surface: #1a1a1a;
+    --ink: #f8f7f4;
+    --accent: #869b82;
+    --ink-faint: rgba(248, 247, 244, 0.15);
+    --ink-medium: rgba(248, 247, 244, 0.6);
   }
 
   body {

@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useMemo } from 'react';
-import { Upload, Settings, List, PieChart as PieChartIcon, Check, Loader2, ChevronLeft, ChevronRight, Calendar } from 'lucide-react';
+import { motion, AnimatePresence } from 'framer-motion';
+import { Upload, Settings, List, PieChart as PieChartIcon, Check, Loader2, ChevronLeft, ChevronRight, Calendar, ShoppingCart, Sun, Moon } from 'lucide-react';
 import { PieChart, Pie, Cell, ResponsiveContainer, Tooltip, Legend } from 'recharts';
 import { format, parseISO, addDays, isWithinInterval, startOfDay, endOfDay } from 'date-fns';
 
@@ -8,6 +9,17 @@ const COLORS = ['#0088FE', '#00C49F', '#FFBB28', '#FF8042', '#8884d8', '#ffc658'
 export default function App() {
   const [activeTab, setActiveTab] = useState<'dashboard' | 'receipts' | 'items' | 'recipes'>('dashboard');
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [isDarkMode, setIsDarkMode] = useState(() => {
+    return document.documentElement.classList.contains('dark');
+  });
+
+  useEffect(() => {
+    if (isDarkMode) {
+      document.documentElement.classList.add('dark');
+    } else {
+      document.documentElement.classList.remove('dark');
+    }
+  }, [isDarkMode]);
   
   // Data
   const [receipts, setReceipts] = useState<any[]>([]);
@@ -35,6 +47,7 @@ export default function App() {
   const [syncPrice, setSyncPrice] = useState<number | string>(0);
   const [syncMode, setSyncMode] = useState<'create' | 'map'>('create');
   const [grocyProducts, setGrocyProducts] = useState<any[]>([]);
+  const [grocyStock, setGrocyStock] = useState<any[]>([]);
   const [selectedProductId, setSelectedProductId] = useState('');
   const [newProductParentId, setNewProductParentId] = useState('');
 
@@ -50,6 +63,8 @@ export default function App() {
   const [mealPlan, setMealPlan] = useState<any[]>([]);
   const [viewingRecipeId, setViewingRecipeId] = useState<number | null>(null);
   const [viewingRecipe, setViewingRecipe] = useState<any>(null);
+  const [confirmDeleteId, setConfirmDeleteId] = useState<number | null>(null);
+  const [recipeSearch, setRecipeSearch] = useState('');
   
   const [recipePage, setRecipePage] = useState(1);
   const recipesPerPage = 12;
@@ -63,7 +78,7 @@ export default function App() {
   const recipesByCategory = useMemo(() => {
     const grouped: Record<string, any[]> = {};
     recipes.forEach(r => {
-      const cat = r.userfields?.category || r.category || 'Uncategorized';
+      const cat = r.userfields?.Category || r.category || 'Uncategorized';
       if (!grouped[cat]) grouped[cat] = [];
       grouped[cat].push(r);
     });
@@ -201,12 +216,32 @@ export default function App() {
   }, [mealPlan, mealPlanStartDate, mealPlanDays]);
 
   const filteredRecipes = useMemo(() => {
-    if (selectedRecipeCategory === 'All') return recipes;
-    return recipes.filter(r => {
-      const cat = r.userfields?.category || r.category || 'Uncategorized';
-      return cat === selectedRecipeCategory;
-    });
-  }, [recipes, selectedRecipeCategory]);
+    let filtered = recipes;
+    if (selectedRecipeCategory !== 'All') {
+      filtered = filtered.filter(r => {
+        const cat = r.userfields?.Category || r.category || 'Uncategorized';
+        return cat === selectedRecipeCategory;
+      });
+    }
+    if (recipeSearch.trim()) {
+      const q = recipeSearch.toLowerCase();
+      filtered = filtered.filter(r => {
+        const nameMatch = (r.name || '').toLowerCase().includes(q);
+        const descriptionMatch = (r.description || '').toLowerCase().includes(q);
+        // We could also check ingredients if r.positions exists, or rely on name/description.
+        // Actually, recipes from /api/grocy/recipes includes nested positions.
+        let ingredientMatch = false;
+        if (r.positions && Array.isArray(r.positions)) {
+          ingredientMatch = r.positions.some((pos: any) => {
+            const product = grocyProducts.find(p => p.id == pos.product_id);
+            return product && product.name.toLowerCase().includes(q);
+          });
+        }
+        return nameMatch || descriptionMatch || ingredientMatch;
+      });
+    }
+    return filtered;
+  }, [recipes, selectedRecipeCategory, recipeSearch, grocyProducts]);
 
   const totalRecipePages = Math.ceil(filteredRecipes.length / recipesPerPage);
   const paginatedRecipes = useMemo(() => {
@@ -216,7 +251,7 @@ export default function App() {
 
   const fetchData = async () => {
     try {
-      const [recRes, itemRes, setRes, statusRes, pendingRes, recipesRes, mealPlanRes, prodRes, quRes] = await Promise.all([
+      const [recRes, itemRes, setRes, statusRes, pendingRes, recipesRes, mealPlanRes, prodRes, quRes, stockRes] = await Promise.all([
         fetch('/api/receipts'),
         fetch('/api/items'),
         fetch('/api/settings'),
@@ -225,7 +260,8 @@ export default function App() {
         fetch('/api/grocy/recipes'),
         fetch('/api/grocy/meal_plan'),
         fetch('/api/grocy/products'),
-        fetch('/api/grocy/quantity_units')
+        fetch('/api/grocy/quantity_units'),
+        fetch('/api/grocy/stock')
       ]);
       setReceipts(await recRes.json());
       setItems(await itemRes.json());
@@ -239,6 +275,9 @@ export default function App() {
       
       const qus = await quRes.json();
       setQuantityUnits(Array.isArray(qus) ? qus : []);
+
+      const stockData = await stockRes.json();
+      setGrocyStock(Array.isArray(stockData) ? stockData : []);
       
       const setJson = await setRes.json();
       setSettings(setJson);
@@ -267,6 +306,18 @@ export default function App() {
   useEffect(() => {
     fetchData();
   }, []);
+
+  useEffect(() => {
+    let interval: any;
+    if (pendingRecipes.length > 0 || recipeSyncing || scrapingRecipe) {
+      interval = setInterval(() => {
+        fetchData();
+      }, 5000);
+    }
+    return () => {
+      if (interval) clearInterval(interval);
+    };
+  }, [pendingRecipes.length, recipeSyncing, scrapingRecipe]);
 
   const handleUpload = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -361,8 +412,9 @@ export default function App() {
         const pendingMatch = pendingRecipes.find(pr => pr.url === recipeUrl);
         if (pendingMatch) {
           await fetch(`/api/recipes/queue/${pendingMatch.id}`, { method: 'DELETE' });
-          fetchData();
         }
+        
+        fetchData();
 
         setScrapedRecipe(null);
         setRecipeUrl('');
@@ -374,6 +426,51 @@ export default function App() {
       alert('Error syncing recipe');
     } finally {
       setRecipeSyncing(false);
+    }
+  };
+
+  const handleDeleteRecipe = async (id: number) => {
+    try {
+      const res = await fetch(`/api/grocy/recipes/${id}`, { method: 'DELETE' });
+      if (res.ok) {
+        setViewingRecipeId(null);
+        setConfirmDeleteId(null);
+        fetchData(); // Refresh recipes list
+      } else {
+        const err = await res.json();
+        alert('Failed to delete recipe: ' + err.error);
+      }
+    } catch (e) {
+      alert('Error deleting recipe');
+    }
+  };
+
+  const [addingToShoppingList, setAddingToShoppingList] = useState(false);
+  
+  const handleAddMissingIngredients = async () => {
+    if (!viewingRecipe || !viewingRecipe.positions) return;
+    setAddingToShoppingList(true);
+    let addedCount = 0;
+    try {
+      for (const pos of viewingRecipe.positions) {
+        const stockItem = grocyStock.find(s => s.product_id === pos.product_id);
+        const stockAmount = stockItem ? parseFloat(stockItem.amount) : 0;
+        const requiredAmount = parseFloat(pos.amount);
+        if (stockAmount < requiredAmount) {
+          const missingAmount = requiredAmount - stockAmount;
+          await fetch('/api/grocy/shopping_list', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ product_id: pos.product_id, amount: missingAmount, note: `For recipe: ${viewingRecipe.name}` })
+          });
+          addedCount++;
+        }
+      }
+      alert(`Added ${addedCount} missing ingredient(s) to shopping list.`);
+    } catch (e) {
+      alert('Error adding items to shopping list');
+    } finally {
+      setAddingToShoppingList(false);
     }
   };
 
@@ -417,14 +514,24 @@ export default function App() {
     <div className="h-screen flex flex-col overflow-hidden bg-[var(--bg)] text-[var(--ink)] font-sans">
       {/* Header */}
       <header className="px-8 py-6 border-b border-[var(--ink-faint)] flex justify-between items-center">
-        <div className="label-text">[ Pantry Partner v2.0 ]</div>
-        <h1 className="font-serif text-3xl font-semibold tracking-tight">Kitchen Archives</h1>
-        <button 
-          onClick={() => setSettingsOpen(true)}
-          className="bg-transparent border-none cursor-pointer text-[var(--ink-medium)] hover:text-[var(--ink)] transition-colors"
-        >
-          <Settings className="w-5 h-5" />
-        </button>
+        <div className="label-text">[ Culinary Hub v2.0 ]</div>
+        <h1 className="font-serif text-3xl font-semibold tracking-tight">Pantry Partner</h1>
+        <div className="flex items-center gap-4">
+          <button 
+            onClick={() => setIsDarkMode(!isDarkMode)}
+            className="bg-transparent border-none cursor-pointer text-[var(--ink-medium)] hover:text-[var(--ink)] transition-colors"
+            title="Toggle Theme"
+          >
+            {isDarkMode ? <Sun className="w-5 h-5" /> : <Moon className="w-5 h-5" />}
+          </button>
+          <button 
+            onClick={() => setSettingsOpen(true)}
+            className="bg-transparent border-none cursor-pointer text-[var(--ink-medium)] hover:text-[var(--ink)] transition-colors"
+            title="Settings"
+          >
+            <Settings className="w-5 h-5" />
+          </button>
+        </div>
       </header>
 
       <div className="flex-1 grid grid-cols-[280px_1fr] overflow-hidden">
@@ -531,44 +638,12 @@ export default function App() {
             </div>
           )}
 
-          {/* Upload Widget */}
-          <section className="border border-[var(--ink-faint)] bg-white p-8 flex flex-col items-center text-center">
-            <form onSubmit={handleUpload} className="w-full max-w-md flex flex-col items-center gap-4">
-              <label 
-                htmlFor="file-upload" 
-                className={`w-full p-12 border border-dashed ${file ? 'border-[var(--accent)] bg-[var(--accent)]/5' : 'border-[var(--ink-medium)] cursor-pointer hover:bg-[var(--ink-faint)]'} transition-colors flex flex-col items-center justify-center`}
-              >
-                <Upload className={`w-8 h-8 mb-4 ${file ? 'text-[var(--accent)]' : 'text-[var(--ink)]'}`} strokeWidth={1.2} />
-                <div className="label-text">Import Documents</div>
-                <p className="text-xs text-[var(--ink-medium)] mt-2">PNG, JPG, PDF up to 10MB</p>
-                <input 
-                  id="file-upload" 
-                  type="file" 
-                  accept="image/*,.pdf"
-                  className="hidden" 
-                  onChange={(e) => setFile(e.target.files?.[0] || null)}
-                />
-              </label>
-              {file && (
-                <div className="flex items-center justify-between w-full bg-[var(--ink-faint)] px-4 py-3 text-sm">
-                  <span className="truncate max-w-[200px] text-[var(--ink)] font-medium">{file.name}</span>
-                  <button 
-                    type="submit" 
-                    disabled={uploading}
-                    className="bg-[var(--accent)] hover:bg-[#4a5847] text-white px-4 py-2 flex items-center gap-2 transition-colors disabled:opacity-50"
-                  >
-                    {uploading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Upload className="w-4 h-4" />}
-                    {uploading ? 'Processing...' : 'Upload & Parse'}
-                  </button>
-                </div>
-              )}
-            </form>
-          </section>
+
 
           {/* Content */}
         {activeTab === 'dashboard' && (
           <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
-            <div className="bg-white border border-[var(--ink-faint)] p-8 shadow-sm">
+            <div className="bg-[var(--surface)] border border-[var(--ink-faint)] p-8 shadow-sm">
               <h2 className="font-serif text-2xl font-semibold mb-6">Spending by Category</h2>
               <div className="h-64">
                 {pieData.length > 0 ? (
@@ -600,7 +675,7 @@ export default function App() {
               </div>
             </div>
             
-            <div className="bg-white border border-[var(--ink-faint)] p-8 shadow-sm flex flex-col">
+            <div className="bg-[var(--surface)] border border-[var(--ink-faint)] p-8 shadow-sm flex flex-col">
               <h2 className="font-serif text-2xl font-semibold mb-6">Recent Items</h2>
               <div className="space-y-4 max-h-[300px] overflow-y-auto pr-2 custom-scrollbar">
                 {items.slice(0, 10).map((item, idx) => (
@@ -619,7 +694,42 @@ export default function App() {
         )}
 
         {activeTab === 'receipts' && (
-          <div className="bg-white border border-[var(--ink-faint)] shadow-sm">
+          <div className="flex flex-col gap-8">
+            {/* Upload Widget */}
+            <section className="border border-[var(--ink-faint)] bg-[var(--surface)] p-8 flex flex-col items-center text-center">
+              <form onSubmit={handleUpload} className="w-full max-w-md flex flex-col items-center gap-4">
+                <label 
+                  htmlFor="file-upload" 
+                  className={`w-full p-12 border border-dashed ${file ? 'border-[var(--accent)] bg-[var(--accent)]/5' : 'border-[var(--ink-medium)] cursor-pointer hover:bg-[var(--ink-faint)]'} transition-colors flex flex-col items-center justify-center`}
+                >
+                  <Upload className={`w-8 h-8 mb-4 ${file ? 'text-[var(--accent)]' : 'text-[var(--ink)]'}`} strokeWidth={1.2} />
+                  <div className="label-text">Import Documents</div>
+                  <p className="text-xs text-[var(--ink-medium)] mt-2">PNG, JPG, PDF up to 10MB</p>
+                  <input 
+                    id="file-upload" 
+                    type="file" 
+                    accept="image/*,.pdf"
+                    className="hidden" 
+                    onChange={(e) => setFile(e.target.files?.[0] || null)}
+                  />
+                </label>
+                {file && (
+                  <div className="flex items-center justify-between w-full bg-[var(--ink-faint)] px-4 py-3 text-sm">
+                    <span className="truncate max-w-[200px] text-[var(--ink)] font-medium">{file.name}</span>
+                    <button 
+                      type="submit" 
+                      disabled={uploading}
+                      className="bg-[var(--accent)] hover:bg-[#4a5847] text-white px-4 py-2 flex items-center gap-2 transition-colors disabled:opacity-50"
+                    >
+                      {uploading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Upload className="w-4 h-4" />}
+                      {uploading ? 'Processing...' : 'Upload & Parse'}
+                    </button>
+                  </div>
+                )}
+              </form>
+            </section>
+            
+            <div className="bg-[var(--surface)] border border-[var(--ink-faint)] shadow-sm">
             <div className="overflow-x-auto">
               <table className="w-full text-left text-sm text-[var(--ink)]">
                 <thead className="bg-[var(--bg)] text-xs uppercase text-[var(--ink-medium)] border-b border-[var(--ink-faint)] font-mono tracking-wider">
@@ -648,10 +758,11 @@ export default function App() {
               </table>
             </div>
           </div>
+          </div>
         )}
         
         {activeTab === 'items' as any && (
-          <div className="bg-white border border-[var(--ink-faint)] shadow-sm">
+          <div className="bg-[var(--surface)] border border-[var(--ink-faint)] shadow-sm">
             <div className="overflow-x-auto">
               <table className="w-full text-left text-sm text-[var(--ink)]">
                 <thead className="bg-[var(--bg)] text-xs uppercase text-[var(--ink-medium)] border-b border-[var(--ink-faint)] font-mono tracking-wider">
@@ -693,7 +804,7 @@ export default function App() {
                             </button>
                             <button 
                               onClick={() => ignoreItem(item.id)}
-                              className="inline-flex items-center gap-1.5 px-4 py-2 text-sm border border-[var(--ink-medium)] text-[var(--ink-medium)] hover:text-[var(--ink)] hover:border-[var(--ink)] transition-colors bg-white"
+                              className="inline-flex items-center gap-1.5 px-4 py-2 text-sm border border-[var(--ink-medium)] text-[var(--ink-medium)] hover:text-[var(--ink)] hover:border-[var(--ink)] transition-colors bg-[var(--surface)]"
                             >
                               Ignore
                             </button>
@@ -719,23 +830,33 @@ export default function App() {
           <div className="space-y-8">
             {recipeTab === 'gallery' && (
               <div className="space-y-8">
-                <div className="flex justify-between items-center pb-4 border-b border-[var(--ink-faint)]">
+                <div className="flex flex-col sm:flex-row sm:justify-between sm:items-center pb-4 border-b border-[var(--ink-faint)] gap-4">
                   <h2 className="font-serif text-2xl font-semibold">
                     {selectedRecipeCategory === 'All' ? 'Recipe Gallery' : `${selectedRecipeCategory} Recipes`}
                   </h2>
+                  <input
+                    type="text"
+                    value={recipeSearch}
+                    onChange={(e) => {
+                      setRecipeSearch(e.target.value);
+                      setRecipePage(1);
+                    }}
+                    placeholder="Search by name or ingredient..."
+                    className="bg-[var(--surface)] border border-[var(--ink-medium)] px-4 py-2 text-sm focus:outline-none focus:border-[var(--ink)] w-full sm:w-64"
+                  />
                 </div>
 
                 <>
                   <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-8">
                     {paginatedRecipes.length === 0 ? (
-                      <div className="col-span-full text-center text-[var(--ink-medium)] py-12 bg-white rounded border border-[var(--ink-faint)]">
+                      <div className="col-span-full text-center text-[var(--ink-medium)] py-12 bg-[var(--surface)] rounded border border-[var(--ink-faint)]">
                         No recipes found. Scrape a recipe to get started.
                       </div>
                     ) : (
                       paginatedRecipes.map(recipe => (
                         <div 
                           key={recipe.id} 
-                          className="bg-white border border-[var(--ink-faint)] flex flex-col cursor-pointer group hover:shadow-sm transition-shadow"
+                          className="bg-[var(--surface)] border border-[var(--ink-faint)] flex flex-col cursor-pointer group hover:shadow-sm transition-shadow"
                           onClick={() => handleViewRecipe(recipe.id)}
                         >
                           {recipe.picture_file_name ? (
@@ -759,7 +880,27 @@ export default function App() {
                             <div className="line-clamp-2 text-sm leading-relaxed text-[var(--ink-medium)]" dangerouslySetInnerHTML={{ __html: recipe.description || '' }} />
                           </div>
                           <div className="mt-auto px-6 py-4 border-t border-[var(--ink-faint)] flex justify-between items-center">
-                            {recipe.base_servings && <span className="label-text">{recipe.base_servings} Servings</span>}
+                            {recipe.base_servings ? <span className="label-text">{recipe.base_servings} Servings</span> : <span />}
+                            {(() => {
+                               let link = "";
+                               const ou = recipe.userfields?.original_url;
+                               if (typeof ou === 'string' && ou.startsWith('{')) {
+                                 try {
+                                   link = JSON.parse(ou).link;
+                                 } catch(e) {}
+                               } else if (typeof ou === 'string' && ou.startsWith('http')) {
+                                 link = ou;
+                               }
+                               if (link) {
+                                 return (
+                                   <a href={link} target="_blank" rel="noopener noreferrer" className="text-[var(--accent)] hover:underline text-sm font-medium flex items-center gap-1" onClick={(e) => e.stopPropagation()}>
+                                     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
+                                     Source
+                                   </a>
+                                 );
+                               }
+                               return null;
+                            })()}
                           </div>
                         </div>
                       ))
@@ -792,7 +933,7 @@ export default function App() {
             )}
 
             {recipeTab === 'mealplan' && (
-              <div className="bg-white border border-[var(--ink-faint)] shadow-sm">
+              <div className="bg-[var(--surface)] border border-[var(--ink-faint)] shadow-sm">
                 <div className="p-6 border-b border-[var(--ink-faint)] flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4">
                   <div>
                     <h2 className="font-serif text-2xl font-semibold">Meal Plan</h2>
@@ -864,7 +1005,7 @@ export default function App() {
 
             {recipeTab === 'scrape' && (
               <div className="space-y-8">
-                <div className="bg-white border border-[var(--ink-faint)] p-8 shadow-sm">
+                <div className="bg-[var(--surface)] border border-[var(--ink-faint)] p-8 shadow-sm">
                   <h2 className="font-serif text-2xl font-semibold mb-2">API Documentation: Add Recipes to Queue</h2>
                   <p className="text-sm text-[var(--ink-medium)] mb-6">
                     You or your AI agents can programmatically queue recipe URLs to be processed later.
@@ -879,7 +1020,7 @@ export default function App() {
                 </div>
 
                 {pendingRecipes.length > 0 && (
-                  <div className="bg-white border border-[var(--ink-faint)] p-8 shadow-sm">
+                  <div className="bg-[var(--surface)] border border-[var(--ink-faint)] p-8 shadow-sm">
                     <h2 className="font-serif text-2xl font-semibold mb-6">Pending Recipe URLs (From API)</h2>
                     <div className="space-y-3">
                       {pendingRecipes.map((pr: any) => (
@@ -908,7 +1049,7 @@ export default function App() {
                   </div>
                 )}
 
-                <div className="bg-white border border-[var(--ink-faint)] p-8 shadow-sm">
+                <div className="bg-[var(--surface)] border border-[var(--ink-faint)] p-8 shadow-sm">
                   <h2 className="font-serif text-2xl font-semibold mb-6">Scrape Recipe</h2>
                   <form onSubmit={handleScrapeRecipe} className="flex gap-4">
                     <input
@@ -931,7 +1072,7 @@ export default function App() {
             </div>
 
             {scrapedRecipe && (
-              <div className="bg-white border border-[var(--ink-faint)] p-8 shadow-sm mt-8">
+              <div className="bg-[var(--surface)] border border-[var(--ink-faint)] p-8 shadow-sm mt-8">
                 <div className="flex justify-between items-start mb-8">
                   <div className="flex gap-6">
                     {scrapedRecipe.imageUrl && (
@@ -939,7 +1080,17 @@ export default function App() {
                     )}
                     <div>
                       <h2 className="font-serif text-2xl font-semibold mb-2">{scrapedRecipe.name}</h2>
-                      <p className="text-sm text-[var(--ink-medium)]">{scrapedRecipe.description}</p>
+                      <p className="text-sm text-[var(--ink-medium)] mb-4">{scrapedRecipe.description}</p>
+                      <div className="flex items-center gap-3">
+                        <label className="text-sm font-medium text-[var(--ink)]">Category</label>
+                        <input
+                          type="text"
+                          className="bg-[var(--surface)] border border-[var(--ink-medium)] px-3 py-1.5 text-sm w-48 focus:outline-none focus:border-[var(--ink)]"
+                          value={scrapedRecipe.category || ''}
+                          onChange={(e) => setScrapedRecipe({ ...scrapedRecipe, category: e.target.value })}
+                          placeholder="e.g. Dinner"
+                        />
+                      </div>
                     </div>
                   </div>
                   <button
@@ -974,7 +1125,7 @@ export default function App() {
                           <input 
                             type="number" 
                             step="0.01"
-                            className="bg-white border border-[var(--ink-medium)] px-3 py-2 w-20 text-xs text-[var(--ink)] focus:outline-none focus:border-[var(--ink)]" 
+                            className="bg-[var(--surface)] border border-[var(--ink-medium)] px-3 py-2 w-20 text-xs text-[var(--ink)] focus:outline-none focus:border-[var(--ink)]" 
                             value={ing.amount || ''} 
                             onChange={(e) => {
                               const newProds = [...(scrapedRecipe.ingredients || [])];
@@ -986,7 +1137,7 @@ export default function App() {
                             list="grocy-units-list"
                             type="text" 
                             placeholder="Unit (Grocy)"
-                            className="bg-white border border-[var(--ink-medium)] px-3 py-2 w-28 text-xs text-[var(--ink)] focus:outline-none focus:border-[var(--ink)]" 
+                            className="bg-[var(--surface)] border border-[var(--ink-medium)] px-3 py-2 w-28 text-xs text-[var(--ink)] focus:outline-none focus:border-[var(--ink)]" 
                             value={ing.selectedQuName !== undefined ? ing.selectedQuName : ing.unit || ''} 
                             onChange={(e) => {
                               const newProds = [...(scrapedRecipe.ingredients || [])];
@@ -1028,7 +1179,7 @@ export default function App() {
                               }
                               setScrapedRecipe({ ...scrapedRecipe, ingredients: newProds });
                             }}
-                            className="bg-white border border-[var(--ink-medium)] px-3 py-2 text-xs text-[var(--ink)] w-[200px] focus:outline-none focus:border-[var(--ink)]"
+                            className="bg-[var(--surface)] border border-[var(--ink-medium)] px-3 py-2 text-xs text-[var(--ink)] w-[200px] focus:outline-none focus:border-[var(--ink)]"
                           />
                           {ing.grocyMatch ? (
                             <span className="text-[var(--accent)] text-xs flex items-center justify-center w-6">
@@ -1054,11 +1205,21 @@ export default function App() {
       </div>
 
       {/* Recipe View Modal */}
+      <AnimatePresence>
       {viewingRecipeId && (
-        <div className="fixed inset-0 bg-black/40 backdrop-blur-sm z-50 flex items-center justify-center p-4 sm:p-6" onClick={() => setViewingRecipeId(null)}>
-          <div 
-            className="bg-white border border-[var(--ink-faint)] w-full max-w-4xl max-h-[90vh] overflow-hidden flex flex-col shadow-2xl" 
-            onClick={(e) => e.stopPropagation()}
+        <motion.div 
+          initial={{ opacity: 0 }}
+          animate={{ opacity: 1 }}
+          exit={{ opacity: 0 }}
+          className="fixed inset-0 bg-black/40 backdrop-blur-sm z-50 flex items-center justify-center p-4 sm:p-6" 
+          onClick={() => setViewingRecipeId(null)}
+        >
+          <motion.div 
+            initial={{ y: 50, opacity: 0 }}
+            animate={{ y: 0, opacity: 1 }}
+            exit={{ y: 50, opacity: 0 }}
+            className="bg-[var(--surface)] border border-[var(--ink-faint)] w-full max-w-4xl max-h-[90vh] overflow-hidden flex flex-col shadow-2xl" 
+            onClick={(e: React.MouseEvent) => e.stopPropagation()}
           >
             {!viewingRecipe ? (
               <div className="flex-1 flex items-center justify-center p-12">
@@ -1080,23 +1241,77 @@ export default function App() {
                     </div>
                   )}
                   <div className="absolute inset-0 bg-gradient-to-t from-black/60 via-transparent to-transparent"></div>
-                  <button 
-                    onClick={() => setViewingRecipeId(null)}
-                    className="absolute top-4 right-4 bg-white/20 hover:bg-white/40 text-white rounded p-2 backdrop-blur transition-colors border-none cursor-pointer"
-                  >
-                    <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>
-                  </button>
+                  
+                  <div className="absolute top-4 right-4 flex items-center gap-2">
+                    {(() => {
+                      let link = "";
+                      const ou = viewingRecipe.userfields?.original_url;
+                      if (typeof ou === 'string' && ou.startsWith('{')) {
+                        try {
+                          link = JSON.parse(ou).link;
+                        } catch(e) {}
+                      } else if (typeof ou === 'string' && ou.startsWith('http')) {
+                        link = ou;
+                      }
+                      if (link) {
+                        return (
+                          <a href={link} target="_blank" rel="noopener noreferrer" title="Original Recipe" className="bg-white/20 hover:bg-white/40 text-white rounded p-2 backdrop-blur transition-colors border-none cursor-pointer flex items-center justify-center decoration-transparent">
+                            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
+                          </a>
+                        );
+                      }
+                      return null;
+                    })()}
+                    <button
+                      title="Add missing to Shopping List"
+                      onClick={handleAddMissingIngredients}
+                      disabled={addingToShoppingList}
+                      className="bg-white/20 hover:bg-white/40 text-white rounded p-2 backdrop-blur transition-colors border-none cursor-pointer flex items-center justify-center disabled:opacity-50"
+                    >
+                      {addingToShoppingList ? <Loader2 className="w-5 h-5 animate-spin" /> : <ShoppingCart className="w-5 h-5" />}
+                    </button>
+                    <a href={`${settings.grocyUrl}/recipe/${viewingRecipe.id}`} target="_blank" rel="noopener noreferrer" title="Edit in Grocy" className="bg-white/20 hover:bg-white/40 text-white rounded p-2 backdrop-blur transition-colors border-none cursor-pointer flex items-center justify-center decoration-transparent">
+                      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M17 3a2.828 2.828 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z"/></svg>
+                    </a>
+                    {confirmDeleteId === viewingRecipe.id ? (
+                      <button 
+                        title="Confirm Delete"
+                        onClick={() => handleDeleteRecipe(viewingRecipe.id)}
+                        className="bg-red-600 text-white rounded px-3 py-2 text-sm font-medium backdrop-blur transition-colors border-none cursor-pointer flex items-center justify-center whitespace-nowrap"
+                      >
+                        Confirm?
+                      </button>
+                    ) : (
+                      <button 
+                        title="Delete Recipe"
+                        onClick={() => setConfirmDeleteId(viewingRecipe.id)}
+                        className="bg-red-500/80 hover:bg-red-500 text-white rounded p-2 backdrop-blur transition-colors border-none cursor-pointer flex items-center justify-center"
+                      >
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 6h18"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></svg>
+                      </button>
+                    )}
+                    <button 
+                      onClick={() => setViewingRecipeId(null)}
+                      title="Close"
+                      className="bg-white/20 hover:bg-white/40 text-white rounded p-2 backdrop-blur transition-colors border-none cursor-pointer flex items-center justify-center"
+                    >
+                      <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>
+                    </button>
+                  </div>
+
                   <div className="absolute bottom-0 left-0 right-0 p-6 sm:p-8">
                     <h2 className="text-3xl sm:text-4xl font-serif font-bold text-white mb-2 leading-tight">{viewingRecipe.name}</h2>
-                    {viewingRecipe.base_servings && (
-                      <div className="inline-flex items-center gap-2 px-3 py-1 bg-white/20 backdrop-blur rounded text-sm font-medium text-white font-mono">
-                        <PieChartIcon className="w-4 h-4" /> {viewingRecipe.base_servings} Servings
-                      </div>
-                    )}
+                    <div className="flex flex-wrap items-center gap-3">
+                      {viewingRecipe.base_servings && (
+                        <div className="inline-flex items-center gap-2 px-3 py-1 bg-white/20 backdrop-blur rounded text-sm font-medium text-white font-mono">
+                          <PieChartIcon className="w-4 h-4" /> {viewingRecipe.base_servings} Servings
+                        </div>
+                      )}
+                    </div>
                   </div>
                 </div>
                 
-                <div className="flex-1 overflow-y-auto custom-scrollbar p-6 sm:p-8 bg-white text-[var(--ink)]">
+                <div className="flex-1 overflow-y-auto custom-scrollbar p-6 sm:p-8 bg-[var(--surface)] text-[var(--ink)]">
                   <div className="grid grid-cols-1 lg:grid-cols-3 gap-8 sm:gap-12">
                     <div className="lg:col-span-1 space-y-8">
                       <div>
@@ -1108,10 +1323,26 @@ export default function App() {
                             {viewingRecipe.positions.map((pos: any) => {
                               const product = grocyProducts.find(p => p.id == pos.product_id);
                               const qu = quantityUnits.find(q => q.id == pos.qu_id);
+                              
+                              const stockItem = grocyStock.find(s => s.product_id === pos.product_id);
+                              const stockAmount = stockItem ? parseFloat(stockItem.amount) : 0;
+                              const requiredAmount = parseFloat(pos.amount);
+                              const hasEnough = stockAmount >= requiredAmount;
+                              const hasSome = stockAmount > 0;
+                              
                               return (
-                                <li key={pos.id} className="flex justify-between items-start border-b border-[var(--ink-faint)] pb-3 last:border-0 text-sm">
-                                  <span className="font-medium text-[var(--ink)]">{product ? product.name : `Product ID: ${pos.product_id}`}</span>
-                                  <span className="text-[var(--ink-medium)] whitespace-nowrap ml-4">
+                                <li key={pos.id} className="flex flex-col sm:flex-row sm:items-center justify-between items-start border-b border-[var(--ink-faint)] pb-3 last:border-0 text-sm gap-2">
+                                  <div className="flex items-center gap-2">
+                                    <span className="font-medium text-[var(--ink)]">{product ? product.name : `Product ID: ${pos.product_id}`}</span>
+                                    {hasEnough ? (
+                                      <span className="text-xs px-2 py-0.5 rounded bg-green-100 text-green-800 border border-green-200">In Stock</span>
+                                    ) : hasSome ? (
+                                      <span className="text-xs px-2 py-0.5 rounded bg-amber-100 text-amber-800 border border-amber-200">Low Stock ({stockAmount})</span>
+                                    ) : (
+                                      <span className="text-xs px-2 py-0.5 rounded bg-red-100 text-red-800 border border-red-200">Out of Stock</span>
+                                    )}
+                                  </div>
+                                  <span className="text-[var(--ink-medium)] whitespace-nowrap">
                                     {pos.amount} {qu ? qu.name : ''}
                                   </span>
                                 </li>
@@ -1143,14 +1374,28 @@ export default function App() {
                 </div>
               </>
             )}
-          </div>
-        </div>
+          </motion.div>
+        </motion.div>
       )}
+      </AnimatePresence>
 
       {/* Sync Item Modal */}
+      <AnimatePresence>
       {syncItemModalOpen && itemToSync && (
-        <div className="fixed inset-0 bg-black/40 backdrop-blur-sm z-50 flex items-center justify-center p-4">
-          <div className="bg-white border border-[var(--ink-faint)] w-full max-w-md p-8 shadow-xl max-h-[90vh] overflow-y-auto custom-scrollbar">
+        <motion.div 
+          initial={{ opacity: 0 }}
+          animate={{ opacity: 1 }}
+          exit={{ opacity: 0 }}
+          className="fixed inset-0 bg-black/40 backdrop-blur-sm z-50 flex items-center justify-center p-4"
+          onClick={() => setSyncItemModalOpen(false)}
+        >
+          <motion.div 
+            initial={{ y: 50, opacity: 0 }}
+            animate={{ y: 0, opacity: 1 }}
+            exit={{ y: 50, opacity: 0 }}
+            className="bg-[var(--surface)] border border-[var(--ink-faint)] w-full max-w-md p-8 shadow-xl max-h-[90vh] overflow-y-auto custom-scrollbar"
+            onClick={(e: React.MouseEvent) => e.stopPropagation()}
+          >
             <h2 className="font-serif text-2xl font-semibold mb-2">Sync Item</h2>
             <p className="text-sm text-[var(--ink-medium)] mb-6">Review and sync <strong className="text-[var(--ink)]">{itemToSync.name}</strong> to Grocy.</p>
             
@@ -1338,14 +1583,15 @@ export default function App() {
                 </div>
               </div>
             )}
-          </div>
-        </div>
+          </motion.div>
+        </motion.div>
       )}
+      </AnimatePresence>
 
       {/* Settings Modal */}
       {settingsOpen && (
         <div className="fixed inset-0 bg-black/40 backdrop-blur-sm z-50 flex items-center justify-center p-4">
-          <div className="bg-white border border-[var(--ink-faint)] w-full max-w-2xl p-8 shadow-xl max-h-[90vh] overflow-y-auto custom-scrollbar">
+          <div className="bg-[var(--surface)] border border-[var(--ink-faint)] w-full max-w-2xl p-8 shadow-xl max-h-[90vh] overflow-y-auto custom-scrollbar">
             <h2 className="font-serif text-2xl font-semibold mb-6">Settings</h2>
             
             <div className="grid grid-cols-1 md:grid-cols-2 gap-10">
@@ -1430,7 +1676,7 @@ export default function App() {
                     <div>
                       <label className="block text-xs font-medium text-[var(--ink-medium)] mb-2">Load Preset</label>
                       <select 
-                        className="w-full bg-white border border-[var(--ink-medium)] px-3 py-1.5 text-sm text-[var(--ink)] focus:outline-none focus:border-[var(--ink)] mb-3"
+                        className="w-full bg-[var(--surface)] border border-[var(--ink-medium)] px-3 py-1.5 text-sm text-[var(--ink)] focus:outline-none focus:border-[var(--ink)] mb-3"
                         onChange={(e) => {
                           const val = e.target.value;
                           if (val === 'openai') {
@@ -1463,7 +1709,7 @@ export default function App() {
                         value={customVisionUrl}
                         onChange={e => setCustomVisionUrl(e.target.value)}
                         placeholder="https://api.openai.com/v1"
-                        className="w-full bg-white border border-[var(--ink-medium)] px-3 py-1.5 text-sm text-[var(--ink)] focus:outline-none focus:border-[var(--ink)]"
+                        className="w-full bg-[var(--surface)] border border-[var(--ink-medium)] px-3 py-1.5 text-sm text-[var(--ink)] focus:outline-none focus:border-[var(--ink)]"
                       />
                     </div>
                     <div>
@@ -1472,7 +1718,7 @@ export default function App() {
                         type="password" 
                         value={customVisionApiKey}
                         onChange={e => setCustomVisionApiKey(e.target.value)}
-                        className="w-full bg-white border border-[var(--ink-medium)] px-3 py-1.5 text-sm text-[var(--ink)] focus:outline-none focus:border-[var(--ink)]"
+                        className="w-full bg-[var(--surface)] border border-[var(--ink-medium)] px-3 py-1.5 text-sm text-[var(--ink)] focus:outline-none focus:border-[var(--ink)]"
                       />
                     </div>
                     <div>
@@ -1482,7 +1728,7 @@ export default function App() {
                         value={customVisionModel}
                         onChange={e => setCustomVisionModel(e.target.value)}
                         placeholder="gpt-4o-mini"
-                        className="w-full bg-white border border-[var(--ink-medium)] px-3 py-1.5 text-sm text-[var(--ink)] focus:outline-none focus:border-[var(--ink)]"
+                        className="w-full bg-[var(--surface)] border border-[var(--ink-medium)] px-3 py-1.5 text-sm text-[var(--ink)] focus:outline-none focus:border-[var(--ink)]"
                       />
                     </div>
                   </div>
@@ -1508,7 +1754,7 @@ export default function App() {
         </div>
       )}
 
-      <footer className="px-8 py-4 border-t border-[var(--ink-faint)] bg-white flex justify-between items-center z-10 relative">
+      <footer className="px-8 py-4 border-t border-[var(--ink-faint)] bg-[var(--surface)] flex justify-between items-center z-10 relative">
         <div className="label-text">Page {String(recipePage).padStart(2, '0')} of {String(totalRecipePages || 1).padStart(2, '0')}</div>
         <div className="flex gap-4">
           <button 

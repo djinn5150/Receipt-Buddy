@@ -72,6 +72,22 @@ async function setupDb() {
 
 setupDb().catch(console.error);
 
+async function withRetry<T>(fn: () => Promise<T>, retries = 3, delay = 1000): Promise<T> {
+  for (let i = 0; i < retries; i++) {
+    try {
+      return await fn();
+    } catch (error: any) {
+      if (i === retries - 1) throw error;
+      if (error.status === 503 || error.status === 429 || (error.message && error.message.includes('503'))) {
+        await new Promise(res => setTimeout(res, delay * (i + 1))); // Exponential backoff
+      } else {
+        throw error; // Don't retry other errors
+      }
+    }
+  }
+  throw new Error("Unreachable");
+}
+
 async function startServer() {
   const app = express();
   const PORT = 3000;
@@ -86,15 +102,15 @@ async function startServer() {
     } catch(e) {}
     
     return {
-      grocyUrl: envConfig.GROCY_URL ?? process.env.GROCY_URL ?? "",
-      grocyApiKey: envConfig.GROCY_API_KEY ?? process.env.GROCY_API_KEY ?? "",
-      hermesWebhookUrl: envConfig.HERMES_WEBHOOK_URL ?? process.env.HERMES_WEBHOOK_URL ?? "",
-      visionProvider: envConfig.VISION_PROVIDER ?? process.env.VISION_PROVIDER ?? "gemini",
-      fallbackProvider: envConfig.FALLBACK_PROVIDER ?? process.env.FALLBACK_PROVIDER ?? "none",
-      customVisionUrl: envConfig.CUSTOM_VISION_URL ?? process.env.CUSTOM_VISION_URL ?? "",
-      customVisionApiKey: envConfig.CUSTOM_VISION_API_KEY ?? process.env.CUSTOM_VISION_API_KEY ?? "",
-      customVisionModel: envConfig.CUSTOM_VISION_MODEL ?? process.env.CUSTOM_VISION_MODEL ?? "",
-      geminiApiKey: envConfig.GEMINI_API_KEY ?? process.env.GEMINI_API_KEY ?? ""
+      grocyUrl: process.env.GROCY_URL || envConfig.GROCY_URL || "",
+      grocyApiKey: process.env.GROCY_API_KEY || envConfig.GROCY_API_KEY || "",
+      hermesWebhookUrl: process.env.HERMES_WEBHOOK_URL || envConfig.HERMES_WEBHOOK_URL || "",
+      visionProvider: process.env.VISION_PROVIDER || envConfig.VISION_PROVIDER || "gemini",
+      fallbackProvider: process.env.FALLBACK_PROVIDER || envConfig.FALLBACK_PROVIDER || "none",
+      customVisionUrl: process.env.CUSTOM_VISION_URL || envConfig.CUSTOM_VISION_URL || "",
+      customVisionApiKey: process.env.CUSTOM_VISION_API_KEY || envConfig.CUSTOM_VISION_API_KEY || "",
+      customVisionModel: process.env.CUSTOM_VISION_MODEL || envConfig.CUSTOM_VISION_MODEL || "",
+      geminiApiKey: process.env.GEMINI_API_KEY || envConfig.GEMINI_API_KEY || ""
     };
   };
 
@@ -267,7 +283,7 @@ async function startServer() {
 
       const runModel = async (provider: string) => {
         if (provider === 'gemini') {
-          const response = await ai.models.generateContent({
+          const response = await withRetry(() => ai.models.generateContent({
             model: "gemini-2.5-pro",
             contents: [
               {
@@ -304,7 +320,7 @@ async function startServer() {
                 required: ["storeName", "date", "total", "items"]
               }
             }
-          });
+          }));
           if (!response.text) throw new Error("No text in response");
           return JSON.parse(response.text);
         } else if (provider === 'custom') {
@@ -498,6 +514,25 @@ async function startServer() {
     }
   });
 
+  app.delete("/api/grocy/recipes/:id", async (req, res) => {
+    try {
+      const settings = await getSettings();
+      if (!settings.grocyUrl || !settings.grocyApiKey) return res.status(400).json({ error: "Grocy not configured" });
+      const baseUrl = getGrocyBaseUrl(settings.grocyUrl);
+      
+      const gRes = await fetch(`${baseUrl}/api/objects/recipes/${req.params.id}`, { 
+        method: 'DELETE',
+        headers: { 'GROCY-API-KEY': settings.grocyApiKey } 
+      });
+      
+      if (!gRes.ok) return res.status(gRes.status).json({ error: "Failed to delete recipe from Grocy" });
+      
+      res.json({ success: true });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
   app.get("/api/grocy/meal_plan", async (req, res) => {
     try {
       const settings = await getSettings();
@@ -543,6 +578,44 @@ async function startServer() {
 
       res.setHeader('Content-Type', gRes.headers.get('content-type') || 'application/octet-stream');
       res.send(buffer);
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.get("/api/grocy/stock", async (req, res) => {
+    try {
+      const settings = await getSettings();
+      if (!settings.grocyUrl || !settings.grocyApiKey) return res.json([]);
+      const baseUrl = getGrocyBaseUrl(settings.grocyUrl);
+      const gRes = await fetch(`${baseUrl}/api/stock`, {
+        headers: { 'GROCY-API-KEY': settings.grocyApiKey }
+      });
+      if (!gRes.ok) return res.json([]);
+      res.json(await gRes.json());
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.post("/api/grocy/shopping_list", async (req, res) => {
+    try {
+      const { product_id, amount, note } = req.body;
+      const settings = await getSettings();
+      if (!settings.grocyUrl || !settings.grocyApiKey) return res.status(400).json({ error: "Grocy not configured" });
+      const baseUrl = getGrocyBaseUrl(settings.grocyUrl);
+      const gRes = await fetch(`${baseUrl}/api/objects/shopping_list`, {
+        method: 'POST',
+        headers: { 'GROCY-API-KEY': settings.grocyApiKey, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          product_id,
+          shopping_list_id: 1,
+          amount: amount || 1,
+          note: note || ''
+        })
+      });
+      if (!gRes.ok) return res.status(gRes.status).json({ error: "Failed to add to shopping list" });
+      res.json(await gRes.json());
     } catch (e: any) {
       res.status(500).json({ error: e.message });
     }
@@ -791,7 +864,7 @@ async function startServer() {
 
       // Ask Gemini to extract
       const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
-      const response = await ai.models.generateContent({
+      const response = await withRetry(() => ai.models.generateContent({
         model: "gemini-2.5-pro",
         contents: [
           { role: "user", parts: [{ text: `Extract the recipe from this content. Provide a JSON object with 'name' (string), 'description' (string), 'category' (string, optional - e.g. Breakfast, Dinner, Dessert, etc), 'imageUrl' (string, optional), 'ingredients' (array of objects with 'originalString' (string, exactly as written in the recipe), 'name' (string), 'amount' (number), 'unit' (string)), and 'instructions' (string, markdown formatted).\n\nIf no recipe is found, return empty fields.\n\nContent:\n${contentToParse.substring(0, 100000)}` }] }
@@ -821,7 +894,7 @@ async function startServer() {
             }
           }
         }
-      });
+      }));
 
       const parsedRecipe = JSON.parse(response.text);
       parsedRecipe.originalUrl = url;
@@ -909,9 +982,8 @@ async function startServer() {
           method: 'PUT',
           headers: { 'GROCY-API-KEY': settings.grocyApiKey, 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            title: recipe.name || '',
-            url: recipe.originalUrl || '',
-            category: recipe.category || ''
+            Category: recipe.category || '',
+            original_url: recipe.originalUrl ? JSON.stringify({ title: recipe.name || '', link: recipe.originalUrl }) : ''
           })
         });
       } catch (e) {
