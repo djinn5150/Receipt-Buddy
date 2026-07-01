@@ -533,6 +533,44 @@ async function startServer() {
     }
   });
 
+  app.put("/api/grocy/recipes/:id/userfields", async (req, res) => {
+    try {
+      const settings = await getSettings();
+      if (!settings.grocyUrl || !settings.grocyApiKey) return res.status(400).json({ error: "Grocy not configured" });
+      const baseUrl = getGrocyBaseUrl(settings.grocyUrl);
+      
+      const userfields = req.body;
+      let gRes = await fetch(`${baseUrl}/api/userfields/recipes/${req.params.id}`, { 
+        method: 'PUT',
+        headers: { 'GROCY-API-KEY': settings.grocyApiKey, 'Content-Type': 'application/json' },
+        body: JSON.stringify(userfields)
+      });
+
+      if (gRes.status === 400) {
+        const errorText = await gRes.text();
+        if (errorText.includes("not a valid userfield")) {
+           if (userfields.Rating !== undefined) {
+             await fetch(`${baseUrl}/api/objects/userfields`, {
+                method: 'POST',
+                headers: { 'GROCY-API-KEY': settings.grocyApiKey, 'Content-Type': 'application/json' },
+                body: JSON.stringify({entity: 'recipes', name: 'Rating', caption: 'Rating', type: 'number'})
+             });
+             gRes = await fetch(`${baseUrl}/api/userfields/recipes/${req.params.id}`, { 
+                method: 'PUT',
+                headers: { 'GROCY-API-KEY': settings.grocyApiKey, 'Content-Type': 'application/json' },
+                body: JSON.stringify(userfields)
+             });
+           }
+        }
+      }
+      
+      if (!gRes.ok) return res.status(gRes.status).json({ error: "Failed to update userfields" });
+      res.json({ success: true });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
   app.get("/api/grocy/meal_plan", async (req, res) => {
     try {
       const settings = await getSettings();

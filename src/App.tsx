@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useMemo } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { Upload, Settings, List, PieChart as PieChartIcon, Check, Loader2, ChevronLeft, ChevronRight, Calendar, ShoppingCart, Sun, Moon } from 'lucide-react';
+import { Upload, Settings, List, PieChart as PieChartIcon, Check, Loader2, ChevronLeft, ChevronRight, Calendar, ShoppingCart, Sun, Moon, Star } from 'lucide-react';
 import { PieChart, Pie, Cell, ResponsiveContainer, Tooltip, Legend } from 'recharts';
 import { format, parseISO, addDays, isWithinInterval, startOfDay, endOfDay } from 'date-fns';
 
@@ -426,6 +426,25 @@ export default function App() {
       alert('Error syncing recipe');
     } finally {
       setRecipeSyncing(false);
+    }
+  };
+
+  const handleRatingChange = async (newRating: number) => {
+    if (!viewingRecipe) return;
+    const currentFields = viewingRecipe.userfields || {};
+    const updatedFields = { ...currentFields, Rating: newRating.toString() };
+    
+    setViewingRecipe({ ...viewingRecipe, userfields: updatedFields });
+    setRecipes(prev => prev.map(r => r.id === viewingRecipe.id ? { ...r, userfields: updatedFields } : r));
+    
+    try {
+      await fetch(`/api/grocy/recipes/${viewingRecipe.id}/userfields`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(updatedFields)
+      });
+    } catch (e) {
+      console.error("Failed to save rating");
     }
   };
 
@@ -1307,6 +1326,19 @@ export default function App() {
                           <PieChartIcon className="w-4 h-4" /> {viewingRecipe.base_servings} Servings
                         </div>
                       )}
+                      <div className="inline-flex items-center gap-1 px-3 py-1 bg-white/20 backdrop-blur rounded text-sm font-medium text-white">
+                        {[1, 2, 3, 4, 5].map((star) => (
+                          <button
+                            key={star}
+                            onClick={(e) => { e.stopPropagation(); handleRatingChange(star); }}
+                            className="bg-transparent border-none p-0 cursor-pointer focus:outline-none transition-transform hover:scale-110"
+                          >
+                            <Star 
+                              className={`w-5 h-5 ${parseInt(viewingRecipe.userfields?.Rating || '0') >= star ? 'text-yellow-400 fill-yellow-400' : 'text-white/60'}`} 
+                            />
+                          </button>
+                        ))}
+                      </div>
                     </div>
                   </div>
                 </div>
