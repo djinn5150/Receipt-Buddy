@@ -3,29 +3,56 @@
 
 @theme {
   --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-serif: "Cormorant Garamond", ui-serif, Georgia, serif;
+  --font-mono: "Space Mono", ui-monospace, SFMono-Regular, monospace;
+}
+
+@layer base {
+  :root {
+    --bg: #f8f7f4;
+    --ink: #1a1a1a;
+    --accent: #5e6d5a;
+    --ink-faint: rgba(26, 26, 26, 0.08);
+    --ink-medium: rgba(26, 26, 26, 0.6);
+  }
+
+  body {
+    background-color: var(--bg);
+    color: var(--ink);
+    font-family: "Inter", sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  
+  ::selection { background: var(--accent); color: white; }
 }
 
 @layer utilities {
   .custom-scrollbar::-webkit-scrollbar {
-    width: 6px;
-    height: 6px;
+    width: 4px;
+    height: 4px;
   }
   .custom-scrollbar::-webkit-scrollbar-track {
     background: transparent;
   }
   .custom-scrollbar::-webkit-scrollbar-thumb {
-    background: #333;
-    border-radius: 3px;
+    background: var(--ink-faint);
+    border-radius: 2px;
   }
   .custom-scrollbar::-webkit-scrollbar-thumb:hover {
-    background: #555;
+    background: var(--ink-medium);
   }
   .custom-date-input::-webkit-calendar-picker-indicator {
-    filter: invert(1);
     opacity: 0.5;
     cursor: pointer;
   }
   .custom-date-input::-webkit-calendar-picker-indicator:hover {
     opacity: 0.8;
+  }
+  .label-text {
+    font-family: 'Space Mono', monospace;
+    font-size: 0.65rem;
+    text-transform: uppercase;
+    letter-spacing: 0.15em;
+    color: var(--ink-medium);
   }
 }

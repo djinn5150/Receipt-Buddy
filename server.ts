@@ -513,6 +513,41 @@ async function startServer() {
     }
   });
 
+  app.get("/api/grocy/images/:group/:filename", async (req, res) => {
+    try {
+      const { group, filename } = req.params;
+      const cacheDir = path.join(process.cwd(), 'data', 'images', group);
+      const filePath = path.join(cacheDir, filename);
+
+      if (fs.existsSync(filePath)) {
+        return res.sendFile(filePath);
+      }
+
+      const settings = await getSettings();
+      if (!settings.grocyUrl || !settings.grocyApiKey) return res.status(400).json({ error: "Grocy not configured" });
+      const baseUrl = getGrocyBaseUrl(settings.grocyUrl);
+
+      const gRes = await fetch(`${baseUrl}/api/files/${group}/${filename}`, {
+        headers: { 'GROCY-API-KEY': settings.grocyApiKey }
+      });
+
+      if (!gRes.ok) return res.status(gRes.status).send(await gRes.text());
+
+      const arrayBuffer = await gRes.arrayBuffer();
+      const buffer = Buffer.from(arrayBuffer);
+
+      if (!fs.existsSync(cacheDir)) {
+        fs.mkdirSync(cacheDir, { recursive: true });
+      }
+      fs.writeFileSync(filePath, buffer);
+
+      res.setHeader('Content-Type', gRes.headers.get('content-type') || 'application/octet-stream');
+      res.send(buffer);
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
   app.get("/api/grocy/quantity_units", async (req, res) => {
     try {
       const settings = await getSettings();
@@ -759,7 +794,7 @@ async function startServer() {
       const response = await ai.models.generateContent({
         model: "gemini-2.5-pro",
         contents: [
-          { role: "user", parts: [{ text: `Extract the recipe from this content. Provide a JSON object with 'name' (string), 'description' (string), 'imageUrl' (string, optional), 'ingredients' (array of objects with 'originalString' (string, exactly as written in the recipe), 'name' (string), 'amount' (number), 'unit' (string)), and 'instructions' (string, markdown formatted).\n\nIf no recipe is found, return empty fields.\n\nContent:\n${contentToParse.substring(0, 100000)}` }] }
+          { role: "user", parts: [{ text: `Extract the recipe from this content. Provide a JSON object with 'name' (string), 'description' (string), 'category' (string, optional - e.g. Breakfast, Dinner, Dessert, etc), 'imageUrl' (string, optional), 'ingredients' (array of objects with 'originalString' (string, exactly as written in the recipe), 'name' (string), 'amount' (number), 'unit' (string)), and 'instructions' (string, markdown formatted).\n\nIf no recipe is found, return empty fields.\n\nContent:\n${contentToParse.substring(0, 100000)}` }] }
         ],
         config: {
           responseMimeType: "application/json",
@@ -768,6 +803,7 @@ async function startServer() {
             properties: {
               name: { type: Type.STRING },
               description: { type: Type.STRING },
+              category: { type: Type.STRING, description: "Category of the recipe (e.g. Breakfast, Dinner, Dessert)" },
               imageUrl: { type: Type.STRING, description: "URL to the recipe image" },
               ingredients: {
                 type: Type.ARRAY,
@@ -788,6 +824,7 @@ async function startServer() {
       });
 
       const parsedRecipe = JSON.parse(response.text);
+      parsedRecipe.originalUrl = url;
 
       // Fuzzy match ingredients with Grocy
       if (settings.grocyUrl && settings.grocyApiKey) {
@@ -865,6 +902,21 @@ async function startServer() {
       if (!createRes.ok) throw new Error(`Failed to create recipe: ${await createRes.text()}`);
       const createdRecipe = await createRes.json();
       const recipeId = createdRecipe.created_object_id || createdRecipe.id;
+
+      // Update Userfields
+      try {
+        await fetch(`${baseUrl}/api/userfields/recipes/${recipeId}`, {
+          method: 'PUT',
+          headers: { 'GROCY-API-KEY': settings.grocyApiKey, 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            title: recipe.name || '',
+            url: recipe.originalUrl || '',
+            category: recipe.category || ''
+          })
+        });
+      } catch (e) {
+        console.error("Error setting userfields:", e);
+      }
 
       // Add Ingredients
       let defaultLocationId: number | null = null;
